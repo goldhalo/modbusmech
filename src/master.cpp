@@ -12,6 +12,7 @@
 #include <netmech/net.hpp>
 
 #include "rtu.hpp"
+#include "tcp.hpp"
 #include "transport.hpp"
 
 #include <chrono>
@@ -219,6 +220,25 @@ std::shared_ptr<Master> Master::create_rtu(const std::string& device,
     rc.baud_rate = baud_rate;
 
     auto tr = detail::RtuTransport::create(device, rc, ec);
+    if (!tr) {
+        return nullptr;
+    }
+
+    auto m = std::shared_ptr<Master>(new Master());
+    m->m_impl = std::make_shared<Impl>();
+    m->m_impl->transport = tr;
+    m->m_impl->cfg = cfg;
+    return m;
+}
+
+std::shared_ptr<Master> Master::create_tcp(const std::string& host,
+                                           std::uint16_t port,
+                                           const Config& cfg,
+                                           std::error_code& ec)
+{
+    ec.clear();
+
+    auto tr = detail::TcpTransport::create(host, port, ec);
     if (!tr) {
         return nullptr;
     }

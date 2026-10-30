@@ -154,9 +154,11 @@ include/modbusmech/   公共头（5 个）
 src/
   pdu.cpp             编解码 + CRC16（纯函数）
   rtu.cpp             RTU 传输（串口 + 帧边界 + CRC）
+  tcp.cpp             TCP 传输（MBAP + 事务 ID）
+  slave.cpp           从站（RTU 单会话 / TCP 多客户端）
   master.cpp          主站逻辑（组帧 / 超时 / 重试）
 
-test/                 23 用例 / 93 断言
+test/                 34 用例 / 170 断言
 docs/design/          概要设计
 ```
 

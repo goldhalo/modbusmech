@@ -18,9 +18,12 @@
 #include <netmech/net.hpp>
 #include <netmech/serial.hpp>
 
+#include "tcp.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -60,6 +63,13 @@ public:
 
     // ---- 串口 ----
     std::shared_ptr<netmech::SerialPort> port;
+
+    // ---- TCP ----
+    std::shared_ptr<netmech::Mechanism> mech;
+    /// ★ 必须存住：Mechanism 只持有 weak_ptr<Linkable>，
+    ///   局部变量销毁后新连接没人接，netmech 会按"无订阅者"立即关闭。
+    std::shared_ptr<netmech::Linkable>  link;
+    std::atomic<std::size_t>            clients{0};
 
     /// 串口事件：收到字节就追加 + 记时间。
     class SerialSink final : public netmech::SerialHandler {
@@ -192,6 +202,148 @@ public:
     /// 处理一个请求 PDU，产出响应 PDU。
     /// @return false 表示无法处理（畸形/未知功能码且不想回异常）
     bool handle_pdu(span<const std::uint8_t> pdu, std::vector<std::uint8_t>& resp);
+
+    /// TCP 的一个客户端会话。
+    ///
+    /// 和 RTU 不同：不用 silence 切帧（MBAP 有长度字段），收到的字节只可能
+    /// 是"半个帧"或"几个帧粘一起"，按长度字段循环切就行。
+    class TcpSession final : public netmech::ConnHandler,
+                             public std::enable_shared_from_this<TcpSession> {
+    public:
+        TcpSession(std::shared_ptr<Impl> owner, std::shared_ptr<netmech::Conn> conn)
+            : m_owner(std::move(owner)), m_conn(std::move(conn))
+        {
+            m_owner->clients.fetch_add(1);
+        }
+
+        ~TcpSession() override
+        {
+            if (m_owner) {
+                m_owner->clients.fetch_sub(1);
+            }
+        }
+
+        bool on_open(std::shared_ptr<netmech::Conn> conn) override
+        {
+            (void)conn;
+            return start_read();
+        }
+
+        void on_read(std::error_code ec, netmech::Buf buf, std::size_t n) override
+        {
+            if (ec) {
+                m_conn->close();
+                return;
+            }
+            if (n > 0) {
+                m_rx.insert(m_rx.end(), static_cast<const std::uint8_t*>(buf.data),
+                            static_cast<const std::uint8_t*>(buf.data) + n);
+                process();
+            }
+            start_read();
+        }
+
+        void on_write(std::error_code ec, netmech::ConstBuf, std::size_t) override
+        {
+            if (ec) {
+                m_conn->close();
+            }
+        }
+
+        void on_close() override {}
+
+    private:
+        bool start_read()
+        {
+            return m_conn->read(netmech::Buf{nullptr, m_chunk.data(), m_chunk.size()});
+        }
+
+        void process()
+        {
+            // MBAP: tid(2) | proto(2) | len(2) | unit(1) | pdu
+            while (true) {
+                if (m_rx.size() < detail::kMbapLen) {
+                    return;
+                }
+                const std::uint16_t tid   = static_cast<std::uint16_t>((m_rx[0] << 8) | m_rx[1]);
+                const std::uint16_t proto = static_cast<std::uint16_t>((m_rx[2] << 8) | m_rx[3]);
+                const std::uint16_t len   = static_cast<std::uint16_t>((m_rx[4] << 8) | m_rx[5]);
+                const std::uint8_t  unit  = m_rx[6];
+
+                if (proto != 0 || len < 2) {
+                    // 帧已经不可信，关掉连接（让它重连重来）
+                    m_conn->close();
+                    return;
+                }
+                const std::size_t total = 6 + len;
+                if (m_rx.size() < total) {
+                    return;   // 还没收够
+                }
+
+                // 取出 PDU（跳过 7 字节 MBAP）
+                const span<const std::uint8_t> pdu(m_rx.data() + detail::kMbapLen,
+                                                   total - detail::kMbapLen);
+                std::vector<std::uint8_t> resp;
+                const bool ok = m_owner->handle_pdu(pdu, resp);
+
+                // 吃掉这一帧
+                m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<std::ptrdiff_t>(total));
+
+                if (!ok) {
+                    continue;   // 畸形帧，忽略
+                }
+
+                // 组响应：回填 tid + unit
+                std::vector<std::uint8_t> out;
+                out.reserve(detail::kMbapLen + resp.size());
+                out.push_back(static_cast<std::uint8_t>(tid >> 8));
+                out.push_back(static_cast<std::uint8_t>(tid & 0xFF));
+                out.push_back(0);
+                out.push_back(0);                                  // 协议 ID
+                const std::uint16_t out_len = static_cast<std::uint16_t>(1 + resp.size());
+                out.push_back(static_cast<std::uint8_t>(out_len >> 8));
+                out.push_back(static_cast<std::uint8_t>(out_len & 0xFF));
+                out.push_back(unit);                               // 回填单元 ID
+                out.insert(out.end(), resp.begin(), resp.end());
+
+                if (resp.size() == 2 && (resp[0] & 0x80u)) {
+                    ++m_owner->stats.exceptions;
+                }
+                m_owner->write_conn(m_conn, std::move(out));
+            }
+        }
+
+        std::shared_ptr<Impl>            m_owner;
+        std::shared_ptr<netmech::Conn>   m_conn;
+        std::vector<std::uint8_t>        m_rx;
+        std::array<std::uint8_t, 1024>   m_chunk{};
+    };
+
+    /// 往一个 Conn 写（TCP 会话用）。
+    void write_conn(const std::shared_ptr<netmech::Conn>& conn,
+                    std::vector<std::uint8_t>&& data)
+    {
+        auto holder = std::make_shared<std::vector<std::uint8_t>>(std::move(data));
+        conn->write(netmech::ConstBuf{holder, holder->data(), holder->size()});
+    }
+
+    /// TCP 的 Linkable：每个 accept 建一个会话。
+    class Link final : public netmech::Linkable {
+    public:
+        explicit Link(std::shared_ptr<Impl> owner) : m_owner(std::move(owner)) {}
+
+        std::shared_ptr<netmech::ConnHandler> on_accept(netmech::Conn& c) override
+        {
+            auto owner = m_owner.lock();
+            if (!owner) {
+                return nullptr;
+            }
+            return std::make_shared<TcpSession>(owner, c.shared_from_this());
+        }
+
+    private:
+        std::weak_ptr<Impl> m_owner;
+    };
 
     void stop()
     {
@@ -385,14 +537,62 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
     return s;
 }
 
+std::shared_ptr<Slave> Slave::create_tcp(std::uint16_t port,
+                                         const Config& cfg,
+                                         std::shared_ptr<RegisterBank> bank,
+                                         std::error_code& ec)
+{
+    ec.clear();
+
+    if (!bank) {
+        ec = make_error_code(ModbusErrc::invalid_argument);
+        return nullptr;
+    }
+
+    auto impl = std::make_shared<Impl>();
+    impl->cfg  = cfg;
+    impl->bank = std::move(bank);
+
+    impl->mech = netmech::Mechanism::create();
+    if (!impl->mech) {
+        ec = make_error_code(ModbusErrc::io_error);
+        return nullptr;
+    }
+
+    auto link = std::make_shared<Impl::Link>(impl);
+    impl->link = link;                    // ★ 存住（见成员注释）
+    const netmech::Address addr{"0.0.0.0", port};
+    impl->mech->set_linkable(link);
+    ec = impl->mech->listen(addr, link);
+    if (ec) {
+        return nullptr;
+    }
+
+    auto s = std::shared_ptr<Slave>(new Slave());
+    s->m_impl = impl;
+    return s;
+}
+
 bool Slave::is_running() const noexcept
 {
-    return m_impl && !m_impl->m_stop.load();
+    if (!m_impl || m_impl->m_stop.load()) {
+        return false;
+    }
+    if (m_impl->mech) {
+        return m_impl->mech->running();
+    }
+    return m_impl->port && m_impl->port->is_open();
 }
 
 std::size_t Slave::client_count() const noexcept
 {
-    return (m_impl && m_impl->port && m_impl->port->is_open()) ? 1u : 0u;
+    if (!m_impl) {
+        return 0;
+    }
+    if (m_impl->mech) {
+        return m_impl->clients.load();
+    }
+    return (m_impl->port && m_impl->port->is_open()) ? 1u : 0u;
 }
 
 Slave::Stats Slave::stats() const noexcept
@@ -408,6 +608,9 @@ void Slave::stop() noexcept
     m_impl->stop();
     if (m_impl->m_thread.joinable()) {
         m_impl->m_thread.join();
+    }
+    if (m_impl->mech) {
+        m_impl->mech->close_all();
     }
 }
 

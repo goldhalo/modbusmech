@@ -1,18 +1,23 @@
-feat: RTU 从站 + 3.5 字符静默改为显式配置
+feat: Modbus TCP 主站与从站（多客户端）
 
-从站与主站最大的不同：它不知道请求有多长，只能用"线路安静下来"判断
-一帧结束。这是 3.5 字符静默唯一的用武之地。
+MBAP 有长度字段和事务 ID，所以比 RTU 简单：不用静默切帧，靠 length 字段
+循环切就行；事务 ID 保证并发下请求/响应能配对。
 
-- Slave::create_rtu：RegisterBank 回调提供寄存器，8 个功能码全支持
-- silence 帧边界：收到字节记时间戳，等 silence_ms 无新字节即认为帧完整
-- CRC 错 / 地址不匹配 → 不应答（规范要求）；广播（地址 0）执行但不应答
-- 地址越界自动回异常码 02，功能码不支持回 01
+- TcpTransport：组/解 MBAP，事务 ID 自增并校验，单元 ID 校验
+- Master::create_tcp：主站侧客户端
+- Slave::create_tcp：从站侧监听，每个客户端一个独立会话，共享 RegisterBank
 
-按你的意见修正：库不再按波特率自动算静默时间。
-  3.5 字符静默只有 RS-485 半双工需要 —— RS-232 全双工、TCP 有 MBAP
-  长度字段，都不需要。而且自动算出来的值大概率不准（USB 转 485 有切换
-  延迟、不同设备容忍度不同），不如让使用者按实测配置。默认 5ms。
+调试过程中抓到两个 netmech 用法上的坑（都写进注释了）：
 
-顺手修掉 wrap_rtu 的 -Wfree-nonheap-object 误报（改用 memcpy 组帧）。
+1. Linkable 必须存住。Mechanism 只持有 weak_ptr<Linkable>，create 里的
+   局部变量一出作用域，新连接就没人接，netmech 会按"无订阅者"立即关闭。
+   现象是客户端连上后立刻收到 EOF。
 
-验证：Linux 29 用例 136 断言，Windows 29 用例 77 断言。
+2. ConnHandler::on_open(conn) 要用传进来的 conn，不能依赖外部先设好的
+   成员。on_linkup 只负责"返回 handler"，紧接着就调 on_open(conn)，此时
+   外部成员可能还是 null，导致 read() 失败、连接被关。
+
+另外修了 TcpTransport 的 on_close 递归（原来调 owner->close()，而 close()
+里又 close_all()，会连带关掉刚建好的连接）。
+
+验证：Linux 34 用例 170 断言，Windows 34 用例 111 断言。
