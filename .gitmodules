@@ -1,0 +1,3 @@
+[submodule "thirdparty/netmech"]
+	path = thirdparty/netmech
+	url = ../netmech

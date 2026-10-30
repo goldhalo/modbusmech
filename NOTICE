@@ -1,0 +1,40 @@
+# NOTICE — 第三方声明与实现说明
+
+---
+
+## 1. 本库不含 libmodbus 代码
+
+| 项 | 说明 |
+|---|---|
+| libmodbus 许可证 | **LGPL-2.1+** |
+| 本库许可证 | **MIT** |
+| 两者的关系 | **独立实现**。本库依据公开规范（Modbus Application Protocol V1.1b3）编写，不包含 libmodbus 的任何源代码 |
+
+如果复制 libmodbus 的代码，本库就必须整体 LGPL。为了保持 MIT，这里选择了
+"参照规范独立实现"，并用 libmodbus 做**对照测试**验证行为一致（只比较输入
+输出，不共享代码）。
+
+**使用 libmodbus 做对照测试不构成衍生作品**——那是测试工具，不是本库的一部分。
+
+---
+
+## 2. netmech
+
+| 项 | 内容 |
+|---|---|
+| 项目地址 | 同级目录 `../netmech` |
+| 许可证 | MIT |
+| 关系 | 提供 TCP 与串口传输、io 线程池 |
+
+本库的 `Master` / `Slave` 通过 netmech 收发字节，自己只负责 Modbus 的
+帧格式与协议逻辑。
+
+---
+
+## 3. 协议规范
+
+- **Modbus Application Protocol Specification V1.1b3**（Modbus Organization）
+- **Modbus over Serial Line Specification V1.02**
+- **Modbus Messaging on TCP/IP Implementation Guide V1.0b**
+
+这些是公开规范，不涉及代码许可。
