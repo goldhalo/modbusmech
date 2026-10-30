@@ -25,14 +25,16 @@ namespace {
 /// 把 PDU 包成 RTU 帧。
 std::vector<std::uint8_t> wrap_rtu(std::uint8_t unit, span<const std::uint8_t> pdu)
 {
-    std::vector<std::uint8_t> frame;
-    frame.reserve(1 + pdu.size() + 2);
-    frame.push_back(unit);
-    frame.insert(frame.end(), pdu.begin(), pdu.end());
+    // 地址(1) | pdu | crc(2)
+    std::vector<std::uint8_t> frame(1 + pdu.size() + 2);
+    frame[0] = unit;
+    if (!pdu.empty()) {
+        std::memcpy(frame.data() + 1, pdu.data(), pdu.size());
+    }
 
-    const std::uint16_t crc = crc16(span<const std::uint8_t>(frame.data(), frame.size()));
-    frame.push_back(static_cast<std::uint8_t>(crc & 0xFF));        // 低字节先
-    frame.push_back(static_cast<std::uint8_t>((crc >> 8) & 0xFF));
+    const std::uint16_t crc = crc16(span<const std::uint8_t>(frame.data(), frame.size() - 2));
+    frame[frame.size() - 2] = static_cast<std::uint8_t>(crc & 0xFF);          // 低字节先
+    frame[frame.size() - 1] = static_cast<std::uint8_t>((crc >> 8) & 0xFF);
     return frame;
 }
 

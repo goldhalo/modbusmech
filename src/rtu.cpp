@@ -28,25 +28,6 @@ namespace {
 constexpr std::size_t kRtuHeader = 2;    // 地址 + 功能码
 constexpr std::size_t kRtuCrc     = 2;
 
-/// 按波特率算 3.5 字符的时间（毫秒，向上取整）。
-///
-/// 一个字符 = 1 起始位 + 数据位 + 校验位 + 停止位。
-std::uint32_t calc_silence_ms(std::uint32_t baud, std::uint8_t data_bits,
-                              std::uint32_t override_ms) noexcept
-{
-    if (override_ms != 0) {
-        return override_ms;
-    }
-    if (baud == 0) {
-        baud = 9600;
-    }
-    // 8N1 → 10 bit/字符；3.5 字符 = 35 bit
-    const double bits_per_char = 1.0 + static_cast<double>(data_bits) + 1.0;
-    const double ms = 3.5 * bits_per_char * 1000.0 / static_cast<double>(baud);
-    // 至少 1ms（再小在多数平台上没有意义）
-    return static_cast<std::uint32_t>(std::max(1.0, ms + 0.5));
-}
-
 /// 从"地址 + 功能码"推算整个响应的长度（不含 CRC）。
 ///
 /// @return 0 表示功能码未知（无法推算）
@@ -166,11 +147,6 @@ std::shared_ptr<RtuTransport> RtuTransport::create(const std::string& device,
 bool RtuTransport::is_open() const noexcept
 {
     return m_port && m_port->is_open();
-}
-
-std::uint32_t RtuTransport::silence_ms() const noexcept
-{
-    return calc_silence_ms(m_cfg.baud_rate, m_cfg.data_bits, m_cfg.silence_ms);
 }
 
 void RtuTransport::on_bytes(const std::uint8_t* data, std::size_t n)
