@@ -8,3 +8,9 @@ Debug/
 Release/
 .vs/
 *.user
+
+# 对照测试的 libmodbus 源码/产物（LGPL，不进本仓库）
+ref/src/
+ref/obj/
+ref/libmodbus.a
+ref/interop_test
