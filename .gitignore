@@ -18,6 +18,11 @@ ref/interop_test
 # 提交信息草稿（临时文件，曾经误入仓库一次）
 .msg
 
+# 本机发布脚本：写死了 D:\3rdlibsIes 与 /usr/3rdlibsIes，
+# 别人 clone 下来跑会往自己盘上写东西 ⇒ 只留本地，不分发
+publish.bat
+publish_linux.sh
+
 # MSVC 编译产物（/Zi 默认把 pdb 落在 cwd，publish.bat 已用 /Fd 指到 build/）
 vc140.pdb
 *.pdb
