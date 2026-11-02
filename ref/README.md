@@ -50,7 +50,7 @@ ar rcs ref/libmodbus.a ref/obj/*.o
 g++ -std=c++17 -O2 -Iinclude -Isrc -Iref/src \
     -I../netmech/include -I../netmech/thirdparty/asio/include \
     ref/interop_test.cpp src/*.cpp ref/libmodbus.a \
-    build/lib/libNetMechanism.a -lpthread -o ref/interop_test
+    build/lib/libnetmech.a -lpthread -o ref/interop_test
 ./ref/interop_test
 ```
 

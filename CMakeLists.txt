@@ -34,7 +34,7 @@ add_library(modbusmech ${MODBUSMECH_SOURCES})
 add_library(modbusmech::modbusmech ALIAS modbusmech)
 target_include_directories(modbusmech PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(modbusmech
-    PUBLIC  NetMechanism
+    PUBLIC  netmech
     PRIVATE modbusmech_compile_options)
 
 if(MODBUSMECH_BUILD_TESTS)
