@@ -16,6 +16,18 @@ set(MODBUSMECH_NETMECH_DIR
 
 option(MODBUSMECH_BUILD_TESTS "构建单元测试" ON)
 
+# 位置无关代码。
+#
+# 本库只出静态库，但**静态库经常被链进 .so**（公司项目里 modbusmech + netmech
+# 一起链进 moc 的 .so）。静态库的 .o 若不含 -fPIC，链接共享库时会报：
+#     relocation R_X86_64_PC32 against symbol `__libc_single_threaded'
+#     can not be used when making a shared object; recompile with -fPIC
+# 而且这个错误只在**最终链 .so 时**才出现，编静态库、跑单测都看不出来。
+#
+# 所以默认开。纯静态链接、且在意那一点点 GOT 间接寻址开销的嵌入式场景，
+# 可以 -DMODBUSMECH_PIC=OFF 关掉。
+option(MODBUSMECH_PIC "编译为位置无关代码（静态库要链进 .so 时必须开）" ON)
+
 add_library(modbusmech_compile_options INTERFACE)
 target_compile_options(modbusmech_compile_options INTERFACE
     $<$<CXX_COMPILER_ID:MSVC>:/utf-8 /W4 /permissive- /Zc:__cplusplus>
@@ -32,6 +44,8 @@ add_subdirectory("${MODBUSMECH_NETMECH_DIR}" "${CMAKE_BINARY_DIR}/netmech" EXCLU
 file(GLOB MODBUSMECH_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 add_library(modbusmech ${MODBUSMECH_SOURCES})
 add_library(modbusmech::modbusmech ALIAS modbusmech)
+set_target_properties(modbusmech PROPERTIES
+    POSITION_INDEPENDENT_CODE ${MODBUSMECH_PIC})
 target_include_directories(modbusmech PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(modbusmech
     PUBLIC  netmech
