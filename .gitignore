@@ -14,3 +14,10 @@ ref/src/
 ref/obj/
 ref/libmodbus.a
 ref/interop_test
+
+# 提交信息草稿（临时文件，曾经误入仓库一次）
+.msg
+
+# MSVC 编译产物（/Zi 默认把 pdb 落在 cwd，publish.bat 已用 /Fd 指到 build/）
+vc140.pdb
+*.pdb

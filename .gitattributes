@@ -1,0 +1,10 @@
+# 行尾统一由这里决定，不依赖各人的 core.autocrlf
+* text=auto
+
+# shell 脚本必须是 LF：CRLF 的 .sh 在 Linux 上会报
+#   /bin/sh^M: bad interpreter: No such file or directory
+*.sh    text eol=lf
+
+# Windows 批处理必须是 CRLF：LF 的 .bat 在 cmd 里 goto/label 会解析异常
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
