@@ -19,7 +19,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -74,6 +76,29 @@ public:
     /// 写多个寄存器（功能码 10）。
     virtual bool write_multiple_registers(std::uint16_t address,
                                           const std::vector<std::uint16_t>& values) = 0;
+
+    /// 上一次 `read_* / write_*` 返回 false 时，希望库回哪个异常码。
+    ///
+    /// 默认 `none` ⇒ 库回标准码 `02`（illegal_data_address，改造前行为）。
+    /// 需要回别的码时（例如"事件记录区为空"按厂家规约要回 `03`），
+    /// 在返回 false **之前**把状态设成想要的码即可。
+    ///
+    /// 场景（AM3SE 事件记录区）：
+    /// @code
+    ///     bool read_input_registers(addr, cnt, out) override {
+    ///         m_lastExc = Exception::none;              // ⚠️ 每次先复位
+    ///         if (addr != kEventArea) { ... }
+    ///         if (m_queue.empty()) {
+    ///             m_lastExc = Exception::illegal_data_value;   // 01 84 03
+    ///             return false;
+    ///         }
+    ///         ...
+    ///     }
+    /// @endcode
+    ///
+    /// @warning 库**不会**自动清空它：一旦设成非 `none`，之后每次失败都会沿用。
+    ///          实现要在下一次调用开头自己复位（上面的例子第一行就是）。
+    virtual Exception last_exception() const { return Exception::none; }
 };
 
 /// 从站。
@@ -82,6 +107,39 @@ public:
     struct Config {
         /// RTU 的从站地址（1~247）。0 表示广播（不应答）。
         std::uint8_t address = 1;
+
+        /// 多从站分派：本实例应答的**全部**地址。
+        ///
+        /// 为空 ⇒ 只用 `address`（与改造前行为逐字相同）。
+        /// 非空 ⇒ 以本集合为准（`address` 不再参与判断）—— 一个串口可以挂
+        ///   多台从站，模拟"一条 485 总线带多个设备"。
+        ///
+        /// @note 真实装置里一个串口只有**一个**从站地址，所以这个能力只对
+        ///       模拟器/网关有意义；对端从站实现请留空。
+        std::set<std::uint8_t> addresses;
+
+        /// 多从站分派：按 unit 取**各自独立的**寄存器组。
+        ///
+        /// 为空 ⇒ 全部 unit 共用 `create_rtu` 传入的那个 bank（原有行为）。
+        /// 非空 ⇒ 每帧先向它要 bank；返回空 ⇒ 该 unit 视为"总线上不存在"，
+        ///   **静默丢弃**（不回异常码 02 —— 真实设备不存在时同样不应答）。
+        ///
+        /// @warning 回调在该传输的 io 线程上调用，实现必须线程安全。
+        std::function<std::shared_ptr<RegisterBank>(std::uint8_t)> bank_for;
+
+        /// 本实例是否应答该 unit。
+        ///
+        /// 广播（unit=0）恒返回 true —— 由调用处负责"接受但不写响应"。
+        [[nodiscard]] bool accepts(std::uint8_t unit) const
+        {
+            if (unit == 0) {
+                return true;
+            }
+            if (!addresses.empty()) {
+                return addresses.count(unit) != 0;
+            }
+            return unit == address;
+        }
 
         /// RTU 的"帧结束"判定方式。
         enum class FrameBoundary {

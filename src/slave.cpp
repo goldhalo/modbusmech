@@ -150,6 +150,18 @@ public:
         }
     }
 
+    /// 取该 unit 对应的寄存器组。
+    ///
+    /// 未配置 `bank_for` ⇒ 全部 unit 共用 `create_rtu/create_tcp` 传入的那个 bank。
+    /// 配置了但回调返回空 ⇒ 该 unit 视为"不存在"，调用处静默丢弃。
+    [[nodiscard]] std::shared_ptr<RegisterBank> pick_bank(std::uint8_t unit) const
+    {
+        if (cfg.bank_for) {
+            return cfg.bank_for(unit);
+        }
+        return bank;
+    }
+
     void handle_frame(std::vector<std::uint8_t>& frame)
     {
         // 最短：地址(1) + 功能码(1) + CRC(2) = 4
@@ -169,10 +181,22 @@ public:
         }
 
         // ---- 地址 ----
+        //
+        // 2026-11-02 多从站：判据从"等于 cfg.address"放宽到 cfg.accepts(unit)。
+        //   留空 addresses ⇒ accepts() 退化成 `unit == cfg.address`，行为不变。
         const std::uint8_t unit = frame[0];
         const bool broadcast = (unit == 0);
-        if (!broadcast && unit != cfg.address) {
-            return;   // 不是给我的，静默丢弃
+        if (!cfg.accepts(unit)) {
+            return;   // 本实例不应答该地址，静默丢弃
+        }
+
+        // ---- 取该 unit 的寄存器组 ----
+        //
+        // ⚠️ 必须持住 shared_ptr 到 handle_pdu 结束：bank_for 每次都可能新建，
+        //    只留裸指针会在回调返回后悬空。
+        auto b = pick_bank(unit);
+        if (!b) {
+            return;   // 该 unit 未注册银行 ⇒ 等价于"总线上没有这台设备"，不应答
         }
 
         ++stats.requests;
@@ -180,7 +204,7 @@ public:
         // ---- 解析 PDU ----
         const span<const std::uint8_t> pdu(frame.data() + 1, data_len - 1);
         std::vector<std::uint8_t> resp;
-        if (!handle_pdu(pdu, resp)) {
+        if (!handle_pdu(*b, pdu, resp)) {
             return;   // 无法处理（畸形帧），丢弃
         }
 
@@ -193,7 +217,10 @@ public:
             ++stats.exceptions;
         }
 
-        auto out = wrap_rtu(cfg.address, span<const std::uint8_t>(resp.data(), resp.size()));
+        // 🔴 响应地址必须回显**请求的 unit**，不能写 cfg.address ——
+        //    多从站模式下 cfg.address 只是个"默认值"，回错地址会让主站把
+        //    响应当噪声丢弃（主站按自己发出的 unit 校验应答）。
+        auto out = wrap_rtu(unit, span<const std::uint8_t>(resp.data(), resp.size()));
         if (port) {
             port->write(netmech::ConstBuf{nullptr, out.data(), out.size()});
         }
@@ -201,7 +228,7 @@ public:
 
     /// 处理一个请求 PDU，产出响应 PDU。
     /// @return false 表示无法处理（畸形/未知功能码且不想回异常）
-    bool handle_pdu(span<const std::uint8_t> pdu, std::vector<std::uint8_t>& resp);
+    bool handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu, std::vector<std::uint8_t>& resp);
 
     /// TCP 的一个客户端会话。
     ///
@@ -283,14 +310,20 @@ public:
                 // 取出 PDU（跳过 7 字节 MBAP）
                 const span<const std::uint8_t> pdu(m_rx.data() + detail::kMbapLen,
                                                    total - detail::kMbapLen);
+
+                // 多从站（2026-11-02）：按 unit 取寄存器组；
+                // 取不到 ⇒ 视为"这台设备不存在"，静默丢弃（但**不**关连接 ——
+                // 同一个 TCP 连接上还会来别的 unit 的请求）。
+                auto b = m_owner->pick_bank(unit);
+
                 std::vector<std::uint8_t> resp;
-                const bool ok = m_owner->handle_pdu(pdu, resp);
+                const bool ok = b ? m_owner->handle_pdu(*b, pdu, resp) : false;
 
                 // 吃掉这一帧
                 m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<std::ptrdiff_t>(total));
 
                 if (!ok) {
-                    continue;   // 畸形帧，忽略
+                    continue;   // 畸形帧或该 unit 无 bank，忽略
                 }
 
                 // 组响应：回填 tid + unit
@@ -366,7 +399,7 @@ public:
 //  请求处理
 // =============================================================================
 
-bool Slave::Impl::handle_pdu(span<const std::uint8_t> pdu,
+bool Slave::Impl::handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu,
                              std::vector<std::uint8_t>& resp)
 {
     resp.clear();
@@ -387,10 +420,24 @@ bool Slave::Impl::handle_pdu(span<const std::uint8_t> pdu,
         (void)encode_exception(f, e, resp);
     };
 
+    /// bank 说"这单做不了"时，到底回哪个异常码。
+    ///
+    /// 默认 `02`（illegal_data_address，与改造前一致）；
+    /// 若 bank 用 `last_exception()` 明确指定了别的码，以它为准。
+    ///
+    /// 🔴 为什么需要这个（2026-11-02）：AM3SE 事件记录区**没有新事件**时，
+    ///   厂家规约回的是 `01 84 03`（illegal_data_value），不是 02；
+    ///   而 EAS 靠"回 03"来判断队列空、靠"传输失败"判断链路故障 ——
+    ///   两者混不起来，回错码会让 EAS 把空队列当成配置错误。
+    auto bank_error = [&]() -> Exception {
+        const Exception e = b.last_exception();
+        return e == Exception::none ? Exception::illegal_data_address : e;
+    };
+
     switch (f) {
     case Function::read_coils: {
         if (d.count == 0 || d.count > Limits::max_read_bits) { exception(Exception::illegal_data_value); return true; }
-        if (!bank->read_coils(d.address, d.count, bits))      { exception(Exception::illegal_data_address); return true; }
+        if (!b.read_coils(d.address, d.count, bits))      { exception(bank_error()); return true; }
         const std::size_t nbytes = (bits.size() + 7) / 8;
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(nbytes));
@@ -405,7 +452,7 @@ bool Slave::Impl::handle_pdu(span<const std::uint8_t> pdu,
 
     case Function::read_discrete_inputs: {
         if (d.count == 0 || d.count > Limits::max_read_bits) { exception(Exception::illegal_data_value); return true; }
-        if (!bank->read_discrete_inputs(d.address, d.count, bits)) { exception(Exception::illegal_data_address); return true; }
+        if (!b.read_discrete_inputs(d.address, d.count, bits)) { exception(bank_error()); return true; }
         const std::size_t nbytes = (bits.size() + 7) / 8;
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(nbytes));
@@ -420,7 +467,7 @@ bool Slave::Impl::handle_pdu(span<const std::uint8_t> pdu,
 
     case Function::read_holding_registers: {
         if (d.count == 0 || d.count > Limits::max_read_registers) { exception(Exception::illegal_data_value); return true; }
-        if (!bank->read_holding_registers(d.address, d.count, regs)) { exception(Exception::illegal_data_address); return true; }
+        if (!b.read_holding_registers(d.address, d.count, regs)) { exception(bank_error()); return true; }
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(regs.size() * 2));
         for (std::uint16_t v : regs) {
@@ -432,7 +479,7 @@ bool Slave::Impl::handle_pdu(span<const std::uint8_t> pdu,
 
     case Function::read_input_registers: {
         if (d.count == 0 || d.count > Limits::max_read_registers) { exception(Exception::illegal_data_value); return true; }
-        if (!bank->read_input_registers(d.address, d.count, regs)) { exception(Exception::illegal_data_address); return true; }
+        if (!b.read_input_registers(d.address, d.count, regs)) { exception(bank_error()); return true; }
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(regs.size() * 2));
         for (std::uint16_t v : regs) {
@@ -445,21 +492,21 @@ bool Slave::Impl::handle_pdu(span<const std::uint8_t> pdu,
     case Function::write_single_coil: {
         // 05 的"值"是 FF00（开）或 0000（关），其他值非法
         if (d.value != 0xFF00 && d.value != 0x0000) { exception(Exception::illegal_data_value); return true; }
-        if (!bank->write_single_coil(d.address, d.value == 0xFF00)) { exception(Exception::illegal_data_address); return true; }
+        if (!b.write_single_coil(d.address, d.value == 0xFF00)) { exception(bank_error()); return true; }
         // 回显原请求
         resp.assign(pdu.begin(), pdu.end());
         return true;
     }
 
     case Function::write_single_register: {
-        if (!bank->write_single_register(d.address, d.value)) { exception(Exception::illegal_data_address); return true; }
+        if (!b.write_single_register(d.address, d.value)) { exception(bank_error()); return true; }
         resp.assign(pdu.begin(), pdu.end());
         return true;
     }
 
     case Function::write_multiple_coils: {
         if (d.bits.size() > Limits::max_write_bits || d.bits.empty()) { exception(Exception::illegal_data_value); return true; }
-        if (!bank->write_multiple_coils(d.address, d.bits)) { exception(Exception::illegal_data_address); return true; }
+        if (!b.write_multiple_coils(d.address, d.bits)) { exception(bank_error()); return true; }
         // 回显"地址 + 数量"
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(d.address >> 8));
@@ -471,7 +518,7 @@ bool Slave::Impl::handle_pdu(span<const std::uint8_t> pdu,
 
     case Function::write_multiple_registers: {
         if (d.registers.size() > Limits::max_write_registers || d.registers.empty()) { exception(Exception::illegal_data_value); return true; }
-        if (!bank->write_multiple_registers(d.address, d.registers)) { exception(Exception::illegal_data_address); return true; }
+        if (!b.write_multiple_registers(d.address, d.registers)) { exception(bank_error()); return true; }
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(d.address >> 8));
         resp.push_back(static_cast<std::uint8_t>(d.address & 0xFF));
@@ -505,11 +552,18 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
 {
     ec.clear();
 
-    if (!bank) {
+    // bank 与 bank_for 至少要有一个（2026-11-02）：
+    //   只有 bank      ⇒ 全部 unit 共用它（改造前行为）
+    //   只有 bank_for  ⇒ 每 unit 各自分派（"一个串口模拟多台从站"的用法）
+    //   两个都有       ⇒ bank_for 优先，bank 作兜底
+    if (!bank && !cfg.bank_for) {
         ec = make_error_code(ModbusErrc::invalid_argument);
         return nullptr;
     }
-    if (cfg.address == 0 || cfg.address > 247) {
+
+    // address 只在"没配 addresses"时才是判据；配了 addresses 就以集合为准，
+    // 此时 address 留默认值即可（不必强求它在 1~247 之间）。
+    if (cfg.addresses.empty() && (cfg.address == 0 || cfg.address > 247)) {
         ec = make_error_code(ModbusErrc::invalid_argument);
         return nullptr;
     }
@@ -544,7 +598,8 @@ std::shared_ptr<Slave> Slave::create_tcp(std::uint16_t port,
 {
     ec.clear();
 
-    if (!bank) {
+    // 同 create_rtu：bank 与 bank_for 至少给一个（TCP 多 unit 时常用 bank_for）
+    if (!bank && !cfg.bank_for) {
         ec = make_error_code(ModbusErrc::invalid_argument);
         return nullptr;
     }

@@ -395,3 +395,243 @@ NETMECH_TEST(slave_returns_illegal_address)
     CHECK(true);
 #endif
 }
+
+
+// ===========================================================================
+//  多从站 / 自定义异常码（2026-11-02 新增）
+// ===========================================================================
+namespace {
+
+/// 所有寄存器都返回同一个值。
+/// 用途：不同 unit 各给一个不同的初值，就能验证"响应来自哪个 bank"。
+class ConstBank final : public RegisterBank {
+public:
+    explicit ConstBank(std::uint16_t v) : m_v(v) {}
+
+    bool read_coils(std::uint16_t, std::uint16_t n, std::vector<bool>& out) override
+    {
+        out.assign(n, m_v != 0);
+        return true;
+    }
+    bool read_discrete_inputs(std::uint16_t, std::uint16_t n, std::vector<bool>& out) override
+    {
+        out.assign(n, m_v != 0);
+        return true;
+    }
+    bool read_holding_registers(std::uint16_t, std::uint16_t n,
+                                std::vector<std::uint16_t>& out) override
+    {
+        out.assign(n, m_v);
+        return true;
+    }
+    bool read_input_registers(std::uint16_t, std::uint16_t n,
+                              std::vector<std::uint16_t>& out) override
+    {
+        out.assign(n, m_v);
+        return true;
+    }
+    bool write_single_coil(std::uint16_t, bool) override { return true; }
+    bool write_single_register(std::uint16_t, std::uint16_t) override { return true; }
+    bool write_multiple_coils(std::uint16_t, const std::vector<bool>&) override { return true; }
+    bool write_multiple_registers(std::uint16_t, const std::vector<std::uint16_t>&) override
+    {
+        return true;
+    }
+
+private:
+    std::uint16_t m_v;
+};
+
+/// 读输入寄存器 = "没有新事件" ⇒ 用 last_exception 明确要求回 03。
+/// 其余区域照样失败，但**不指定码** ⇒ 应回默认的 02。
+///
+/// ★ 每个方法开头都复位 m_exc —— 这是 last_exception 的正确用法，库不会代劳。
+class EmptyEventQueueBank final : public RegisterBank {
+public:
+    bool read_input_registers(std::uint16_t, std::uint16_t,
+                              std::vector<std::uint16_t>&) override
+    {
+        m_exc = Exception::illegal_data_value;   // 01 84 03
+        return false;
+    }
+    Exception last_exception() const override { return m_exc; }
+
+    bool read_coils(std::uint16_t, std::uint16_t, std::vector<bool>&) override
+    {
+        m_exc = Exception::none;
+        return false;
+    }
+    bool read_discrete_inputs(std::uint16_t, std::uint16_t, std::vector<bool>&) override
+    {
+        m_exc = Exception::none;
+        return false;
+    }
+    bool read_holding_registers(std::uint16_t, std::uint16_t,
+                                std::vector<std::uint16_t>&) override
+    {
+        m_exc = Exception::none;
+        return false;
+    }
+    bool write_single_coil(std::uint16_t, bool) override
+    {
+        m_exc = Exception::none;
+        return false;
+    }
+    bool write_single_register(std::uint16_t, std::uint16_t) override
+    {
+        m_exc = Exception::none;
+        return false;
+    }
+    bool write_multiple_coils(std::uint16_t, const std::vector<bool>&) override
+    {
+        m_exc = Exception::none;
+        return false;
+    }
+    bool write_multiple_registers(std::uint16_t, const std::vector<std::uint16_t>&) override
+    {
+        m_exc = Exception::none;
+        return false;
+    }
+
+private:
+    mutable Exception m_exc = Exception::none;
+};
+
+} // namespace
+
+#if defined(__linux__)
+namespace {
+
+/// 往 pty master 发一帧请求并收响应。
+///
+/// @param wantLen 收到这么多字节就返回（>0）；
+///                传 0 表示"一直等到 timeout"，用来验证"不应答"。
+std::vector<std::uint8_t> slave_exchange(Pty& pty, std::vector<std::uint8_t> req,
+                                         std::size_t wantLen = 0,
+                                         std::chrono::milliseconds timeout = 500ms)
+{
+    const std::uint16_t c = crc16(span<const std::uint8_t>(req.data(), req.size()));
+    req.push_back(static_cast<std::uint8_t>(c & 0xFF));
+    req.push_back(static_cast<std::uint8_t>((c >> 8) & 0xFF));
+
+    if (::write(pty.master, req.data(), req.size()) != static_cast<ssize_t>(req.size())) {
+        return {};
+    }
+
+    std::vector<std::uint8_t> resp;
+    std::uint8_t              buf[64];
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto       lastData = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < deadline) {
+        const ssize_t r = ::read(pty.master, buf, sizeof(buf));
+        if (r > 0) {
+            resp.insert(resp.end(), buf, buf + r);
+            lastData = std::chrono::steady_clock::now();
+            if (wantLen > 0 && resp.size() >= wantLen) {
+                break;
+            }
+        } else {
+            // 已经收到过数据、且静默够久 ⇒ 认为这一帧收完了
+            if (wantLen > 0 && !resp.empty()
+                && std::chrono::steady_clock::now() - lastData > 30ms) {
+                break;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+    }
+    return resp;
+}
+
+} // namespace
+#endif
+
+// ---------------------------------------------------------------------------
+// 7. 多从站：一个 Slave 实例应答多个地址，各地址有独立寄存器组
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_multiple_unit_addresses)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    Slave::Config sc;
+    sc.addresses  = {1, 2};   // ← 一个串口模拟两台从站
+    sc.silence_ms = 5;
+    sc.bank_for   = [](std::uint8_t unit) -> std::shared_ptr<RegisterBank> {
+        return std::make_shared<ConstBank>(
+            static_cast<std::uint16_t>(unit == 1 ? 0x1111 : 0x2222));
+    };
+
+    std::error_code ec;
+    // bank 传 nullptr：全部靠 bank_for 分派（这正是 moc 的用法）
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, nullptr, ec);
+    REQUIRE(slave != nullptr);
+
+    // ① unit=1 ⇒ 值 0x1111，响应地址回 0x01
+    //    帧布局：地址(0) | 功能码(1) | 字节数(2) | 高字节(3) | 低字节(4) | CRC(5,6)
+    const auto r1 = slave_exchange(pty, {0x01, 0x03, 0x00, 0x00, 0x00, 0x01}, 7);
+    REQUIRE(r1.size() >= 7u);
+    CHECK_EQ(r1[0], 0x01);
+    CHECK_EQ(r1[1], 0x03);
+    CHECK_EQ(r1[2], 0x02);   // 1 个寄存器 = 2 字节
+    CHECK_EQ(r1[3], 0x11);
+    CHECK_EQ(r1[4], 0x11);
+
+    // ② unit=2 ⇒ 值 0x2222，响应地址必须是 0x02
+    //     🔴 这里若回成 cfg.address(=1)，主站会把它当噪声丢弃 —— 多从站的经典坑
+    const auto r2 = slave_exchange(pty, {0x02, 0x03, 0x00, 0x00, 0x00, 0x01}, 7);
+    REQUIRE(r2.size() >= 7u);
+    CHECK_EQ(r2[0], 0x02);
+    CHECK_EQ(r2[1], 0x03);
+    CHECK_EQ(r2[2], 0x02);
+    CHECK_EQ(r2[3], 0x22);
+    CHECK_EQ(r2[4], 0x22);
+
+    // ③ unit=5（不在 addresses 里）⇒ 静默丢弃
+    const auto r3 = slave_exchange(pty, {0x05, 0x03, 0x00, 0x00, 0x00, 0x01}, 0, 200ms);
+    CHECK(r3.empty());
+
+    slave->stop();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 8. 自定义异常码：bank 说"队列空"时回 03；没说时仍是默认的 02
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_custom_exception_code)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    auto bank = std::make_shared<EmptyEventQueueBank>();
+
+    Slave::Config sc;
+    sc.address    = 1;
+    sc.silence_ms = 5;
+
+    std::error_code ec;
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    // ① 读输入寄存器（fc=04）⇒ bank 指定了 03
+    const auto r1 = slave_exchange(pty, {0x01, 0x04, 0x00, 0x00, 0x00, 0x01}, 5);
+    REQUIRE(r1.size() >= 5u);
+    CHECK_EQ(r1[0], 0x01);
+    CHECK_EQ(r1[1], 0x84);   // 功能码 | 0x80
+    CHECK_EQ(r1[2], 0x03);   // ← 自定义码（AM3SE 事件区空队列靠它）
+
+    // ② 读保持寄存器（fc=03）⇒ bank 没指定码，应回默认的 02
+    //    同时验证"上一次的 03 没有污染这一次"
+    const auto r2 = slave_exchange(pty, {0x01, 0x03, 0x00, 0x00, 0x00, 0x01}, 5);
+    REQUIRE(r2.size() >= 5u);
+    CHECK_EQ(r2[1], 0x83);
+    CHECK_EQ(r2[2], 0x02);
+
+    slave->stop();
+#else
+    CHECK(true);
+#endif
+}
