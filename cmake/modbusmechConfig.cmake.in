@@ -1,0 +1,22 @@
+@PACKAGE_INIT@
+
+# -----------------------------------------------------------------------------
+#  modbusmechConfig.cmake —— find_package(modbusmech) 的入口
+# -----------------------------------------------------------------------------
+#  用法：
+#      find_package(modbusmech REQUIRED)
+#      target_link_libraries(app PRIVATE modbusmech::modbusmech)
+#
+#  modbusmech 静态库依赖 netmech（TCP/串口底层），导出的 target 里带着
+#  对 netmech::netmech 的引用，所以必须先把 netmech 包找出来。
+#  先 find_package(netmech) 再 find_package(modbusmech) 也行，
+#  find_dependency 是幂等的。
+# -----------------------------------------------------------------------------
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(netmech)
+
+include("${CMAKE_CURRENT_LIST_DIR}/modbusmechTargets.cmake")
+
+check_required_components(modbusmech)

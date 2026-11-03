@@ -8,6 +8,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# 安装目录规范。必须早于 target 定义：$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+# 里的变量是立即展开的，晚定义会展开成空串。
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 set(MODBUSMECH_NETMECH_DIR
@@ -46,7 +51,9 @@ add_library(modbusmech ${MODBUSMECH_SOURCES})
 add_library(modbusmech::modbusmech ALIAS modbusmech)
 set_target_properties(modbusmech PROPERTIES
     POSITION_INDEPENDENT_CODE ${MODBUSMECH_PIC})
-target_include_directories(modbusmech PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(modbusmech PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(modbusmech
     PUBLIC  netmech
     PRIVATE modbusmech_compile_options)
@@ -65,3 +72,49 @@ if(MODBUSMECH_BUILD_TESTS)
         add_test(NAME modbusmech_ut COMMAND modbusmech_ut)
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# 安装与导出
+# ---------------------------------------------------------------------------
+#  装完之后使用者只需要：
+#      find_package(modbusmech REQUIRED)
+#      target_link_libraries(app PRIVATE modbusmech::modbusmech)
+#  netmech 会由 Config 里的 find_dependency 自动找出来，不用手写
+#  libmodbusmech.a + libnetmech.a 那一串。
+#
+#  默认前缀：Linux -> /usr/local，Windows -> C:/Program Files/modbusmech
+# ---------------------------------------------------------------------------
+install(TARGETS modbusmech
+        EXPORT modbusmechTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# 编译选项载体（PRIVATE 依赖在静态库场景下仍会进 interface，必须一起导出）
+install(TARGETS modbusmech_compile_options EXPORT modbusmechTargets)
+
+install(DIRECTORY include/modbusmech
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.hpp")
+
+install(EXPORT modbusmechTargets
+        FILE modbusmechTargets.cmake
+        NAMESPACE modbusmech::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/modbusmech)
+
+configure_package_config_file(cmake/modbusmechConfig.cmake.in
+        "${CMAKE_CURRENT_BINARY_DIR}/modbusmechConfig.cmake"
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/modbusmech)
+
+write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/modbusmechConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion)
+
+install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/modbusmechConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/modbusmechConfigVersion.cmake"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/modbusmech)
+
+install(FILES LICENSE NOTICE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/modbusmech)

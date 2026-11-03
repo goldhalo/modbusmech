@@ -1,5 +1,26 @@
 # Changelog
 
+## [未发布]
+
+### 新增
+
+**CMake 安装与导出（find_package）**
+
+- `cmake --install` 现在装出完整的一套：头文件、静态库、`lib/cmake/modbusmech/` 下的
+  `modbusmechConfig.cmake` / `modbusmechConfigVersion.cmake` / `modbusmechTargets.cmake`，
+  以及 `share/doc/modbusmech` 下的 LICENSE / NOTICE
+- 使用者只需要两行：
+  ```cmake
+  find_package(modbusmech REQUIRED)
+  target_link_libraries(app PRIVATE modbusmech::modbusmech)
+  ```
+- Config 里 `find_dependency(netmech)`：`libmodbusmech.a + libnetmech.a + pthread`
+  这一串不用再手写
+
+- 默认安装前缀：Linux `/usr/local`，Windows `C:/Program Files/modbusmech`
+
+---
+
 ## [0.9.0] — 首个版本
 
 Modbus RTU / TCP 的协议实现。网络层用 netmech，协议层参照公开规范独立实现

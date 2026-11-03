@@ -164,6 +164,36 @@ docs/design/          概要设计
 
 ---
 
+## 在其他项目里使用（find_package）
+
+先装 netmech（本仓的子工程，`EXCLUDE_FROM_ALL` 不会跟着装），再装本仓：
+
+```bash
+# 1) netmech
+cmake -S ../netmech -B ../netmech/build && cmake --build ../netmech/build -j
+cmake --install ../netmech/build
+
+# 2) modbusmech（默认前缀：Linux /usr/local，Windows C:/Program Files/modbusmech）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+cmake --install build
+```
+
+然后在自己的工程里：
+
+```cmake
+find_package(modbusmech REQUIRED)
+target_link_libraries(app PRIVATE modbusmech::modbusmech)
+```
+
+**不用再手写 `libmodbusmech.a + libnetmech.a + pthread` 那一串** ——
+`modbusmechConfig.cmake` 里 `find_dependency(netmech)` 会把它找出来，
+链接库、include 路径都由导入的 target 带着走。
+
+安装前缀不在默认位置时给 `-DCMAKE_PREFIX_PATH=<前缀>`（多个前缀用分号隔开）。
+
+---
+
 ## 致谢
 
 本项目的实现与文档在 **DeepSeek-V4.1** 的协助下完成 —— 架构决策与验收由作者负责。
