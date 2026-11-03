@@ -15,6 +15,12 @@ include(CMakePackageConfigHelpers)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# 静态库统一放 build/lib —— 与 netmech / rtspmech / rtpmech / mpegmech 一致。
+# 之前本仓的 .a 落在构建目录根上、netmech 的落在 build/lib/，写链接命令时
+# 得在两个目录之间来回切，很容易漏。
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+
 set(MODBUSMECH_NETMECH_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../netmech"
     CACHE PATH "netmech 所在目录")
