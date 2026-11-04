@@ -3,6 +3,7 @@
 // =============================================================================
 #include "tcp.hpp"
 
+#include <atomic>
 #include <netmech/net.hpp>
 
 #include <array>
