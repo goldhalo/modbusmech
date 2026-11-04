@@ -60,7 +60,8 @@ jobs:
           cmake --build build --parallel 2>&1 | tee /tmp/build.log
           rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
-            line=$(grep -m1 -E "error:|warning:" /tmp/build.log | cut -c1-300)
+            line=$(grep -m1 -E "error:" /tmp/build.log | cut -c1-300)
+            [ -z "$line" ] && line=$(grep -m1 -E "warning:" /tmp/build.log | cut -c1-300)
             [ -z "$line" ] && line=$(tail -3 /tmp/build.log | tr '\n' ' ')
             echo "::error title=构建失败::$line"
             exit 1
