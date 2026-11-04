@@ -21,9 +21,18 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+# 默认**优先用 git submodule**（thirdparty/netmech），没有再退回同级目录。
+#
+# 原先只认 ../netmech：本地两个仓并排时能用，但 CI 里 submodules: recursive
+# 把 netmech 检出到 thirdparty/netmech，配置阶段就会报"找不到 netmech"。
+# 两种布局都照顾到之后，本地和 CI 都不需要额外传参。
 set(MODBUSMECH_NETMECH_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/../netmech"
-    CACHE PATH "netmech 所在目录")
+    "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/netmech"
+    CACHE PATH "netmech 所在目录（默认使用 git submodule）")
+if(NOT EXISTS "${MODBUSMECH_NETMECH_DIR}/CMakeLists.txt"
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../netmech/CMakeLists.txt")
+    set(MODBUSMECH_NETMECH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../netmech")
+endif()
 
 option(MODBUSMECH_BUILD_TESTS "构建单元测试" ON)
 
