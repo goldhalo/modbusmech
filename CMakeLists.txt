@@ -40,9 +40,18 @@ option(MODBUSMECH_BUILD_TESTS "构建单元测试" ON)
 option(MODBUSMECH_PIC "编译为位置无关代码（静态库要链进 .so 时必须开）" ON)
 
 add_library(modbusmech_compile_options INTERFACE)
+# 多个选项用 ';' 分隔，不要靠空格 —— 空格写法只有 Makefile/Ninja
+# "把选项拼成命令行"时才恰好正确，VS 生成器会原样塞进 AdditionalOptions。
 target_compile_options(modbusmech_compile_options INTERFACE
-    $<$<CXX_COMPILER_ID:MSVC>:/utf-8 /W4 /permissive- /Zc:__cplusplus>
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>)
+    $<$<CXX_COMPILER_ID:MSVC>:/utf-8;/W4;/permissive-;/Zc:__cplusplus>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra>)
+
+option(MODBUSMECH_WARNINGS_AS_ERRORS "把编译告警当错误（CI 用）" OFF)
+if(MODBUSMECH_WARNINGS_AS_ERRORS)
+    target_compile_options(modbusmech_compile_options INTERFACE
+        $<$<CXX_COMPILER_ID:MSVC>:/WX>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Werror>)
+endif()
 
 # netmech：串口 + TCP 的底层
 if(NOT EXISTS "${MODBUSMECH_NETMECH_DIR}/CMakeLists.txt")
