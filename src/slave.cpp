@@ -20,6 +20,7 @@
 
 #include "tcp.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
