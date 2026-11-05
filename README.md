@@ -158,7 +158,7 @@ src/
   slave.cpp           从站（RTU 单会话 / TCP 多客户端）
   master.cpp          主站逻辑（组帧 / 超时 / 重试）
 
-test/                 34 用例 / 170 断言
+test/                 36 用例 / 194 断言
 docs/design/          概要设计
 ```
 
