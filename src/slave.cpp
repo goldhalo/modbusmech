@@ -29,6 +29,12 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <memory>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <utility>
 
 namespace modbusmech {
 

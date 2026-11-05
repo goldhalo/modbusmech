@@ -3,6 +3,9 @@
 // =============================================================================
 #include <modbusmech/common.hpp>
 
+#include <string>
+#include <system_error>
+
 namespace modbusmech {
 
 bool is_known_function(Function f) noexcept

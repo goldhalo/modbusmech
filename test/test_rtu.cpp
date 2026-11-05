@@ -15,6 +15,12 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <utility>
 
 #include "test_framework.hpp"
 

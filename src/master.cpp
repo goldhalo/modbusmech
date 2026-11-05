@@ -18,6 +18,12 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <memory>
+#include <vector>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <utility>
 
 namespace modbusmech {
 

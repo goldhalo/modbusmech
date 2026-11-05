@@ -6,6 +6,10 @@
 #include <modbusmech/pdu.hpp>
 
 #include <cstring>
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <system_error>
 
 namespace modbusmech {
 

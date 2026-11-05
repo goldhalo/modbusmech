@@ -10,6 +10,10 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <chrono>
+#include <cstddef>
+#include <string>
+#include <system_error>
 
 #include <modbusmech/common.hpp>
 

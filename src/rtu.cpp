@@ -17,6 +17,15 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <memory>
+#include <vector>
+#include <mutex>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <utility>
 
 namespace modbusmech {
 namespace detail {

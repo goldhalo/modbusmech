@@ -11,6 +11,14 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <memory>
+#include <vector>
+#include <mutex>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <utility>
 
 namespace modbusmech {
 namespace detail {

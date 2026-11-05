@@ -15,6 +15,12 @@
 #include <cstring>
 #include <thread>
 #include <vector>
+#include <atomic>
+#include <memory>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <system_error>
 
 #include "test_framework.hpp"
 
