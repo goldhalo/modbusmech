@@ -127,6 +127,31 @@ public:
         /// @warning 回调在该传输的 io 线程上调用，实现必须线程安全。
         std::function<std::shared_ptr<RegisterBank>(std::uint8_t)> bank_for;
 
+        /// **新 TCP 连接鉴权**（只对 `create_tcp` 生效；RTU 是点对点串口，
+        /// 没有"谁连进来"这个概念）。
+        ///
+        /// 每条连接被 accept 时调用一次：
+        ///  - 返回 `true`  ⇒ 正常建立会话；
+        ///  - 返回 `false` ⇒ 库**立刻关掉**这条连接（不读一帧、不回应），
+        ///                   并计入 `stats().rejected_clients`。
+        ///
+        /// @param[in] peer_ip   对端 IP 字面量（如 `"192.168.1.10"`，不含端口）
+        /// @param[in] peer_port 对端端口
+        ///
+        /// @par 典型用法：白名单
+        /// @code
+        ///     sc.authorize = [](const std::string& ip, std::uint16_t) {
+        ///         return ip == "192.168.1.10" || ip == "192.168.1.11";
+        ///     };
+        /// @endcode
+        ///
+        /// @warning 在该连接的 **io 线程**上调用，**不要阻塞**（查库、读文件都会
+        ///          拖住同时刻的其它连接）。要查的东西请提前准备好，回调里只做比较。
+        /// @warning 回调里抛出的异常会被吞掉并按"拒绝"处理 —— 不让异常穿过
+        ///          netmech 的回调栈。
+        /// @note 不设置 ⇒ 接受所有连接（与改造前行为一致）。
+        std::function<bool(const std::string& peer_ip, std::uint16_t peer_port)> authorize;
+
         /// 本实例是否应答该 unit。
         ///
         /// 广播（unit=0）恒返回 true —— 由调用处负责"接受但不写响应"。
@@ -186,6 +211,7 @@ public:
         std::uint64_t requests   = 0;
         std::uint64_t exceptions = 0;   ///< 回出去异常的次数
         std::uint64_t bad_frames = 0;   ///< CRC/长度错的帧（直接丢弃）
+        std::uint64_t rejected_clients = 0;   ///< 被 `authorize` 拒绝的连接数
     };
     [[nodiscard]] Stats stats() const noexcept;
 

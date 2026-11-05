@@ -275,3 +275,102 @@ NETMECH_TEST(tcp_multiple_clients)
 
     slave->stop();
 }
+
+// ---------------------------------------------------------------------------
+// 鉴权：authorize 返回 false ⇒ 连接被立刻关掉，且计入 rejected_clients
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
+{
+    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    REQUIRE(port_opt.has_value());
+    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+
+    auto bank = std::make_shared<Bank>();
+
+    std::atomic<int>         calls{0};
+    std::atomic<bool>        saw_loopback{false};
+    Slave::Config            sc;
+    sc.authorize = [&](const std::string& ip, std::uint16_t) {
+        calls.fetch_add(1);
+        if (ip == "127.0.0.1") {
+            saw_loopback.store(true);
+        }
+        return false;   // 一律拒绝
+    };
+
+    std::error_code ec;
+    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    Master::Config mc;
+    mc.unit    = 1;
+    mc.timeout = 300ms;
+    mc.retries = 0;
+
+    auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+    // TCP 握手本身会成功（库是在 accept 之后才拒的），所以这里不强制 nullptr
+
+    // 等到库记录了一次拒绝
+    for (int i = 0; i < 200 && slave->stats().rejected_clients == 0; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    CHECK_EQ(slave->stats().rejected_clients, 1u);
+    CHECK_EQ(calls.load(), 1);      // 每条连接只问一次
+    CHECK(saw_loopback.load());     // 回调拿到的是对端 IP 字面量
+
+    // 被拒之后请求必然失败（连接已被关）
+    if (master) {
+        std::vector<std::uint16_t> regs;
+        const Result r = master->read_holding_registers(0, 1, regs);
+        CHECK(!r.ok());
+        master->close();
+    }
+
+    slave->stop();
+}
+
+// ---------------------------------------------------------------------------
+// 鉴权：authorize 返回 true ⇒ 正常服务（顺带验证回调拿到的 IP 正确）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tcp_slave_authorize_allows_known_peer)
+{
+    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    REQUIRE(port_opt.has_value());
+    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+
+    auto bank = std::make_shared<Bank>();
+
+    std::atomic<int>  calls{0};
+    std::atomic<bool> saw_loopback{false};
+    Slave::Config     sc;
+    sc.authorize = [&](const std::string& ip, std::uint16_t) {
+        calls.fetch_add(1);
+        saw_loopback.store(ip == "127.0.0.1");
+        return true;
+    };
+
+    std::error_code ec;
+    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    Master::Config mc;
+    mc.unit    = 1;
+    mc.timeout = 1000ms;
+    mc.retries = 0;
+
+    auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+    REQUIRE(master != nullptr);
+
+    std::vector<std::uint16_t> regs;
+    const Result r = master->read_holding_registers(5, 2, regs);
+    CHECK_MSG(r.ok(), r.describe().c_str());
+    REQUIRE(regs.size() == 2u);
+    CHECK_EQ(regs[0], 50);
+
+    CHECK_EQ(calls.load(), 1);
+    CHECK(saw_loopback.load());
+    CHECK_EQ(slave->stats().rejected_clients, 0u);
+
+    master->close();
+    slave->stop();
+}

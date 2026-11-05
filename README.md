@@ -68,6 +68,36 @@ auto slave = modbusmech::Slave::create_rtu("COM3", 9600, cfg,
                                            std::make_shared<MyBank>(), ec);
 ```
 
+#### TCP 从站：新连接鉴权
+
+Modbus 协议本身**没有**认证。要在"谁能连进来"这一层做控制，用
+`Config::authorize` —— 每条 TCP 连接被 accept 时回调一次：
+
+```cpp
+modbusmech::Slave::Config cfg;
+cfg.address = 1;
+
+// 白名单：不在名单里的连接直接被关掉（不读一帧、不回应）
+cfg.authorize = [](const std::string& peer_ip, std::uint16_t /*peer_port*/) {
+    return peer_ip == "192.168.1.10" || peer_ip == "192.168.1.11";
+};
+
+auto slave = modbusmech::Slave::create_tcp(502, cfg, bank, ec);
+
+// 被拒了多少条，看统计：
+//   slave->stats().rejected_clients
+```
+
+几点注意：
+
+- **只看 IP/端口**：accept 时还没收到任何 Modbus 帧，所以拿不到 unit id；
+  要按 unit 区分请用 `Config::addresses` / `bank_for`。
+- **回调在 io 线程上跑**，不能阻塞（查库、读文件都会拖住同时刻的其它连接）。
+  需要查的东西提前准备好，回调里只做比较。
+- 回调抛异常会被吞掉并按**拒绝**处理 —— 不让异常穿过 netmech 的回调栈。
+- 不设置 ⇒ 接受所有连接（与旧行为一致）。
+- RTU 是点对点串口，没有"谁连进来"的概念，这个回调**只对 `create_tcp` 生效**。
+
 ---
 
 ## 三个必须知道的点
@@ -144,7 +174,7 @@ ctest --test-dir build --output-on-failure
 ## 目录结构
 
 ```
-include/modbusmech/   公共头（5 个）
+include/modbusmech/   公共头
   common.hpp          功能码 / 异常码 / Result / 错误码
   span.hpp            轻量 span
   pdu.hpp             PDU 编解码（纯函数，无 IO）
@@ -158,7 +188,7 @@ src/
   slave.cpp           从站（RTU 单会话 / TCP 多客户端）
   master.cpp          主站逻辑（组帧 / 超时 / 重试）
 
-test/                 36 用例 / 194 断言
+test/                 单元测试
 docs/design/          概要设计
 ```
 

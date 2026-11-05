@@ -378,6 +378,25 @@ public:
             if (!owner) {
                 return nullptr;
             }
+
+            // ---- 鉴权：每条新连接问一次应用 ----
+            // 返回 nullptr 就是"拒收"，netmech 会立刻关掉这条连接
+            // （不读一帧、不回应，对端只看到连接被关）。
+            if (owner->cfg.authorize) {
+                const auto addr = c.remote_address();
+                bool       ok   = false;
+                try {
+                    ok = owner->cfg.authorize(addr.address_string(), addr.port());
+                } catch (...) {
+                    ok = false;   // 回调抛异常 ⇒ 按拒绝处理，绝不穿过 netmech 的回调栈
+                }
+                if (!ok) {
+                    // 与其它计数器保持一致的写法（on_accept 由监听器串行驱动）
+                    ++owner->stats.rejected_clients;
+                    return nullptr;
+                }
+            }
+
             return std::make_shared<TcpSession>(owner, c.shared_from_this());
         }
 
