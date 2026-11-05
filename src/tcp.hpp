@@ -49,7 +49,7 @@ public:
     [[nodiscard]] bool is_open() const noexcept override;
 
     /// 发一帧。**调用方传来的 frame 是裸 PDU**，这里负责加 MBAP。
-    std::error_code send(span<const std::uint8_t> frame) override;
+    std::error_code send(span<const std::uint8_t> pdu, std::uint8_t unit) override;
 
     /// 收一帧。返回的是**裸 PDU**（MBAP 已剥掉并校验）。
     std::error_code receive(std::vector<std::uint8_t>& out,
@@ -96,7 +96,6 @@ private:
 
     std::uint16_t m_next_tid = 1;      ///< 下一次请求用的事务 ID
     std::uint16_t m_pending_tid = 0;   ///< 已发出、正在等响应的事务 ID
-    std::uint8_t  m_unit = 1;
 };
 
 } // namespace detail

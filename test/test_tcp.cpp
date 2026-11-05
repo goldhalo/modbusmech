@@ -374,3 +374,58 @@ NETMECH_TEST(tcp_slave_authorize_allows_known_peer)
     master->close();
     slave->stop();
 }
+
+// ---------------------------------------------------------------------------
+// 配置的 unit 必须真的进到 MBAP 里
+//
+// 回归用例：以前 TcpTransport 里有个 `m_unit = 1` 的成员，**从来没有被赋值**，
+// 组 MBAP 时却用它 → 无论 Config::unit 设成几，报文里的 unit 恒为 1；
+// 而 receive() 又拿 cfg.unit 校验 → unit != 1 时永远失败。
+// 之前所有用例都用默认 unit=1，所以一直没抓到。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tcp_master_uses_configured_unit)
+{
+    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    REQUIRE(port_opt.has_value());
+    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+
+    auto bank = std::make_shared<Bank>();
+
+    // 只应答 unit=7：用 bank_for 把"不是 7 的 unit"显式判为不存在。
+    //
+    //   注意：TCP 从站默认**应答任意 unit**（一个 IP:port 后面可能挂多台设备，
+    //   靠 unit 区分），所以这里必须用 bank_for 才能构造出"unit 不对就不理"的场景。
+    Slave::Config sc;
+    sc.bank_for = [bank](std::uint8_t unit) -> std::shared_ptr<RegisterBank> {
+        return unit == 7 ? bank : nullptr;
+    };
+    std::error_code ec;
+    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    // 主站 unit = 7：能通
+    Master::Config mc;
+    mc.unit    = 7;
+    mc.timeout = 1000ms;
+    mc.retries = 0;
+
+    auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+    REQUIRE(master != nullptr);
+
+    std::vector<std::uint16_t> regs;
+    const Result r = master->read_holding_registers(5, 2, regs);
+    CHECK_MSG(r.ok(), r.describe().c_str());
+    REQUIRE(regs.size() == 2u);
+    CHECK_EQ(regs[0], 50);
+
+    // 改成别的 unit：从站不会应答（超时）。
+    // 这一条才真正证明"报文里的 unit 用的是我们配的值" ——
+    // 以前 transport 里那个恒为 1 的 m_unit 会让两种情况都失败/都成功。
+    master->set_unit(9);
+    regs.clear();
+    const Result r2 = master->read_holding_registers(5, 2, regs);
+    CHECK(!r2.ok());
+
+    master->close();
+    slave->stop();
+}

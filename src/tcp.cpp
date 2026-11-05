@@ -48,13 +48,14 @@ public:
 
     bool on_open(std::shared_ptr<netmech::Conn> conn) override
     {
-        // ★ 这里必须用传进来的 conn —— on_linkup 只负责"返回 handler"，
-        //   库紧接着调 on_open(conn)，此时 TcpTransport::m_conn 可能还没设。
-        //   早先的实现里 start_read() 检查 owner->m_conn（null）就返回 false，
-        //   结果 netmech 直接把刚建好的连接关掉了。
-        if (auto owner = m_owner.lock()) {
-            owner->m_conn = conn;
-        }
+        // ★ 只用传进来的 conn，**不要**写 owner->m_conn。
+        //
+        //   这里之前是 `owner->m_conn = conn`：on_open 跑在 io 线程上，而
+        //   TcpTransport::create() 在**调用线程**上也会写 m_conn（等 linkup
+        //   之后赋值）—— 两个线程无同步地写同一个 shared_ptr，TSan 直接报在
+        //   create() 那一行上。
+        //   现在 m_conn 只在 create() 里赋值一次（此时 io 线程还没开始用它），
+        //   on_open/on_read 都走参数或 m_conn 的只读路径。
         return conn && conn->read(netmech::Buf{nullptr, m_chunk.data(), m_chunk.size()});
     }
 
@@ -116,26 +117,39 @@ class TcpTransport::Link final : public netmech::Linkable {
 public:
     std::shared_ptr<netmech::ConnHandler> handler;
 
-    std::atomic<netmech::Conn*> conn{nullptr};
-    std::atomic<int>            err_code{0};
-    std::string                 err_msg;
+    /// connect 的结果（**受 mtx 保护**，不能是裸成员）。
+    ///
+    /// 以前这里是一个 `std::shared_ptr<Conn> conn_holder` + 两个原子标志：
+    /// 原子标志自己没事，但 `conn_holder` 由 io 线程写、调用线程读，
+    /// 是无同步的 shared_ptr 读写（TSan 直接报在 create() 的两行上）。
+    /// 更根本的问题是**轮询**（500 × 10ms）：既慢又不精确。
+    /// 现在改成 mutex + condition_variable，谁先到谁通知。
+    std::mutex              mtx;
+    std::condition_variable cv;
+    bool                    done = false;
+    std::shared_ptr<netmech::Conn> conn;
+    std::error_code         err;
 
     std::shared_ptr<netmech::ConnHandler> on_linkup(netmech::Conn& c) override
     {
-        conn.store(c.shared_from_this().get(), std::memory_order_release);
-        // 注意：这里只存裸指针用于"是否有结果"的判断，
-        // 真正的 shared_ptr 在下面拿到后由 TcpTransport 持有。
-        conn_holder = c.shared_from_this();
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            conn = c.shared_from_this();
+            done = true;
+        }
+        cv.notify_all();
         return handler;
     }
 
     void on_linkfail(const netmech::Address&, std::error_code e) override
     {
-        err_code.store(e.value(), std::memory_order_release);
-        err_msg = e.message();
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            err  = e;
+            done = true;
+        }
+        cv.notify_all();
     }
-
-    std::shared_ptr<netmech::Conn> conn_holder;
 };
 
 // =============================================================================
@@ -176,25 +190,31 @@ std::shared_ptr<TcpTransport> TcpTransport::create(const std::string& host,
         return nullptr;
     }
 
-    // connect 是异步的：等 on_linkup（conn 非空）或 on_linkfail
-    for (int i = 0; i < 500; ++i) {
-        if (link->conn.load(std::memory_order_acquire) != nullptr
-            || link->err_code.load(std::memory_order_acquire) != 0) {
-            break;
+    // connect 是异步的：等 on_linkup / on_linkfail 通知。
+    //
+    // netmech 的 connect() 自带超时（默认 3000ms，到点走 on_linkfail），
+    // 这里给一个稍宽的上限纯粹是兜底 —— 正常情况下 cv 会被立刻唤醒，
+    // 不再像以前那样每 10ms 醒一次、最多空转 5 秒。
+    std::shared_ptr<netmech::Conn> connected;
+    {
+        std::unique_lock<std::mutex> lk(link->mtx);
+        if (!link->cv.wait_for(lk, std::chrono::milliseconds(5000),
+                               [&] { return link->done; })) {
+            ec = make_error_code(ModbusErrc::timeout);
+            return nullptr;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (link->err) {
+            ec = link->err;
+            return nullptr;
+        }
+        connected = link->conn;
     }
-
-    if (link->err_code.load(std::memory_order_acquire) != 0) {
-        ec = std::make_error_code(static_cast<std::errc>(link->err_code.load()));
-        return nullptr;
-    }
-    if (!link->conn_holder) {
+    if (!connected) {
         ec = make_error_code(ModbusErrc::timeout);
         return nullptr;
     }
 
-    self->m_conn = link->conn_holder;
+    self->m_conn = std::move(connected);
     return self;
 }
 
@@ -218,12 +238,12 @@ void TcpTransport::flush_input()
     m_rx.clear();
 }
 
-std::error_code TcpTransport::send(span<const std::uint8_t> frame)
+std::error_code TcpTransport::send(span<const std::uint8_t> pdu, std::uint8_t unit)
 {
     if (!is_open()) {
         return make_error_code(ModbusErrc::not_connected);
     }
-    if (frame.size() > Limits::max_pdu) {
+    if (pdu.size() > Limits::max_pdu) {
         return make_error_code(ModbusErrc::frame_too_long);
     }
 
@@ -232,12 +252,12 @@ std::error_code TcpTransport::send(span<const std::uint8_t> frame)
     m_pending_tid = tid;
 
     std::vector<std::uint8_t> adu;
-    adu.reserve(kMbapLen + frame.size());
+    adu.reserve(kMbapLen + pdu.size());
     put_u16(adu, tid);
-    put_u16(adu, 0);                                        // 协议 ID
-    put_u16(adu, static_cast<std::uint16_t>(1 + frame.size()));   // 单元 ID + PDU
-    adu.push_back(m_unit);
-    adu.insert(adu.end(), frame.begin(), frame.end());
+    put_u16(adu, 0);                                          // 协议 ID
+    put_u16(adu, static_cast<std::uint16_t>(1 + pdu.size())); // 单元 ID + PDU
+    adu.push_back(unit);                                      // ← 用调用方传的 unit
+    adu.insert(adu.end(), pdu.begin(), pdu.end());
 
     auto holder = std::make_shared<std::vector<std::uint8_t>>(std::move(adu));
     if (!m_conn->write(netmech::ConstBuf{holder, holder->data(), holder->size()})) {
@@ -279,21 +299,47 @@ std::error_code TcpTransport::receive(std::vector<std::uint8_t>& out,
         len   = get_u16(m_rx.data() + 4);
         u     = m_rx[6];
     }
+    // ★ 失败路径必须把坏帧从缓冲里**吃掉**。
+    //   以前只 return 不清缓冲：下一帧会从残帧的错误偏移处开始切，
+    //   于是"一帧坏、后面全乱"（bad_transaction / bad_unit_id 会一直报下去）。
     if (proto != 0) {
+        // 协议 ID 不对 ⇒ len 也不可信，只吃掉 MBAP 头（7 字节已确认在缓冲里）
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_rx.size() >= kMbapLen) {
+            m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<std::ptrdiff_t>(kMbapLen));
+        }
         return make_error_code(ModbusErrc::bad_protocol_id);
     }
     if (len < 2 || len > Limits::max_tcp_adu) {
+        // 长度非法 ⇒ 帧边界彻底不可信，只能整段丢弃
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_rx.clear();
         return make_error_code(ModbusErrc::bad_length);
     }
+
+    const std::size_t total = 6 + len;   // MBAP 的前 6 字节 + 长度字段说明的部分
+
     if (tid != m_pending_tid) {
+        // 事务号对不上：这条响应不是我们这次请求的（迟到的上一条）。
+        // 长度字段可信，按整帧吃掉。
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_rx.size() >= total) {
+            m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<std::ptrdiff_t>(total));
+        } else {
+            m_rx.clear();   // 还没收全，边界不可用；丢掉重来
+        }
         return make_error_code(ModbusErrc::bad_transaction);
     }
     // 单元 ID 要跟请求一致（一个 TCP 连接可以访问多个单元，靠它区分）
     if (u != unit) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_rx.size() >= total) {
+            m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<std::ptrdiff_t>(total));
+        } else {
+            m_rx.clear();
+        }
         return make_error_code(ModbusErrc::bad_unit_id);
     }
-
-    const std::size_t total = 6 + len;   // MBAP 的前 6 字节 + 长度字段说明的部分
 
     // ---- 等够整帧 ----
     {

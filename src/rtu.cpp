@@ -10,6 +10,7 @@
 //  线程上跑，靠 mutex + condition_variable 同步。
 // =============================================================================
 #include "rtu.hpp"
+#include "wire.hpp"
 
 #include <modbusmech/pdu.hpp>
 #include <netmech/serial.hpp>
@@ -37,9 +38,12 @@ namespace {
 constexpr std::size_t kRtuHeader = 2;    // 地址 + 功能码
 constexpr std::size_t kRtuCrc     = 2;
 
+} // namespace
+
 /// 从"地址 + 功能码"推算整个响应的长度（不含 CRC）。
 ///
-/// @return 0 表示功能码未知（无法推算）
+/// @return 0 表示"还算不出来"（数据不够）或功能码未知 —— 两者都要由调用方
+///         区分：读类响应只收到 2 字节时是前者（要等第 3 字节），未知功能码是后者。
 std::size_t rtu_response_body_len(const std::uint8_t* p, std::size_t avail) noexcept
 {
     if (avail < 2) {
@@ -75,7 +79,6 @@ std::size_t rtu_response_body_len(const std::uint8_t* p, std::size_t avail) noex
     }
 }
 
-} // namespace
 
 // =============================================================================
 //  Handler：netmech 的串口事件
@@ -173,11 +176,14 @@ void RtuTransport::flush_input()
     m_rx.clear();
 }
 
-std::error_code RtuTransport::send(span<const std::uint8_t> frame)
+std::error_code RtuTransport::send(span<const std::uint8_t> pdu, std::uint8_t unit)
 {
     if (!is_open()) {
         return make_error_code(ModbusErrc::not_connected);
     }
+
+    // RTU 的封装在这里做：地址 + PDU + CRC16
+    const std::vector<std::uint8_t> frame = detail::wrap_rtu(unit, pdu);
     if (!m_port->write(netmech::ConstBuf{nullptr, frame.data(), frame.size()})) {
         return make_error_code(ModbusErrc::io_error);
     }
@@ -192,32 +198,48 @@ std::error_code RtuTransport::receive(std::vector<std::uint8_t>& out,
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
 
-    // ---- 第一阶段：等地址 + 功能码（2 字节）----
+    // ---- 第一阶段：同步到"地址 + 功能码" ----
+    //
+    //  ★ 这里是个**重同步循环**，不是"等 2 个字节"那么简单：
+    //    · 总线上可能有别的从站的应答（多主站/上一次的残留），地址不匹配就
+    //      丢 1 个字节继续找 —— 以前是直接返回 bad_unit_id，残帧留在缓冲里，
+    //      retries=0 时这一轮就没救了；
+    //    · 读类响应（01/02/03/04）的**总长要等第 3 字节（byte count）**才能算。
+    //      以前只等到 2 字节就去算长度，rtu_response_body_len 在 avail<3 时
+    //      返回 0 → 直接判 unexpected_response。9600bps 下 1 字节 ≈ 1ms，
+    //      串口几乎必然分次到达 —— 真机上表现为"读类请求随机失败"，
+    //      而 pty 测试一次 write 全到，反而测不出来。
     {
         std::unique_lock<std::mutex> lk(m_mtx);
-        if (!m_cv.wait_until(lk, deadline, [&] {
-                return m_closed || !m_rx.empty();
-            })) {
-            return make_error_code(ModbusErrc::timeout);
+
+        for (;;) {
+            if (!m_cv.wait_until(lk, deadline, [&] {
+                    return m_closed || m_rx.size() >= kRtuHeader;
+                })) {
+                return make_error_code(ModbusErrc::timeout);
+            }
+            if (m_closed) {
+                return make_error_code(ModbusErrc::not_connected);
+            }
+            if (m_rx[0] == unit) {
+                break;
+            }
+            // 不是给我们的：吃掉这 1 个字节再找帧头
+            m_rx.erase(m_rx.begin());
         }
-        if (m_closed) {
-            return make_error_code(ModbusErrc::not_connected);
-        }
-        // 地址不匹配：可能是别的从站的应答（多主站/错配），丢掉
-        // 这里先只要求至少 1 字节，拿到地址再判断
-        if (!m_cv.wait_until(lk, deadline, [&] {
-                return m_closed || m_rx.size() >= 1;
-            })) {
-            return make_error_code(ModbusErrc::timeout);
-        }
-        if (m_rx[0] != unit) {
-            // 不是给我们的，丢弃这一帧的头部，让上层重试/超时
-            return make_error_code(ModbusErrc::bad_unit_id);
-        }
-        if (!m_cv.wait_until(lk, deadline, [&] {
-                return m_closed || m_rx.size() >= kRtuHeader;
-            })) {
-            return make_error_code(ModbusErrc::timeout);
+
+        const std::uint8_t func = m_rx[1];
+        const bool         is_read =
+            (func & 0x80u) == 0 && (func == 1 || func == 2 || func == 3 || func == 4);
+        if (is_read) {
+            if (!m_cv.wait_until(lk, deadline, [&] {
+                    return m_closed || m_rx.size() >= 3;
+                })) {
+                return make_error_code(ModbusErrc::timeout);
+            }
+            if (m_closed) {
+                return make_error_code(ModbusErrc::not_connected);
+            }
         }
     }
 

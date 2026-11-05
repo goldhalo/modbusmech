@@ -60,7 +60,7 @@ public:
     ~RtuTransport() override;
 
     [[nodiscard]] bool is_open() const noexcept override;
-    std::error_code send(span<const std::uint8_t> frame) override;
+    std::error_code send(span<const std::uint8_t> pdu, std::uint8_t unit) override;
     std::error_code receive(std::vector<std::uint8_t>& out,
                             std::chrono::milliseconds timeout,
                             std::uint8_t unit) override;
@@ -91,6 +91,19 @@ private:
     std::vector<std::uint8_t> m_rx;
     bool                    m_closed = false;
 };
+
+/// 按已收到的响应前缀推算"整帧（不含 CRC）有多长"。
+///
+/// @param[in] p     已收到的字节
+/// @param[in] avail 已收到多少字节
+/// @return 0 表示**现在还算不出来**（数据不够）或功能码不认识。
+///
+/// @note 关键点：01/02/03/04 这些读类响应，长度要靠**第 3 字节（byte count）**
+///       才能算 —— 只收到 2 字节时返回 0。调用方必须等够 3 字节再来问，
+///       否则会把"数据还没到"当成"响应不对"。这条曾经是个真 bug
+///       （9600bps 下读类请求随机失败）。
+[[nodiscard]] std::size_t rtu_response_body_len(const std::uint8_t* p,
+                                                std::size_t         avail) noexcept;
 
 } // namespace detail
 } // namespace modbusmech

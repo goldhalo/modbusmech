@@ -108,7 +108,8 @@ public:
     struct Stats {
         std::uint64_t requests = 0;
         std::uint64_t succeeded = 0;
-        std::uint64_t timeouts  = 0;
+        std::uint64_t timeouts  = 0;   ///< 等响应超时
+        std::uint64_t send_errors = 0; ///< 本地发送失败（连接断了 / 写不进去），不是超时
         std::uint64_t exceptions = 0;
         std::uint64_t crc_errors = 0;
     };

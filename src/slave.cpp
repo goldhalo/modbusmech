@@ -14,6 +14,8 @@
 // =============================================================================
 #include <modbusmech/slave.hpp>
 
+#include "wire.hpp"
+
 #include <modbusmech/pdu.hpp>
 #include <netmech/net.hpp>
 #include <netmech/serial.hpp>
@@ -42,20 +44,6 @@ namespace {
 
 using namespace std::chrono_literals;
 
-/// 给 PDU 追加 CRC 并返回完整帧。
-std::vector<std::uint8_t> wrap_rtu(std::uint8_t unit, span<const std::uint8_t> pdu)
-{
-    std::vector<std::uint8_t> frame(1 + pdu.size() + 2);
-    frame[0] = unit;
-    if (!pdu.empty()) {
-        std::memcpy(frame.data() + 1, pdu.data(), pdu.size());
-    }
-    const std::uint16_t crc = crc16(span<const std::uint8_t>(frame.data(), frame.size() - 2));
-    frame[frame.size() - 2] = static_cast<std::uint8_t>(crc & 0xFF);
-    frame[frame.size() - 1] = static_cast<std::uint8_t>((crc >> 8) & 0xFF);
-    return frame;
-}
-
 } // namespace
 
 // =============================================================================
@@ -66,10 +54,19 @@ class Slave::Impl : public std::enable_shared_from_this<Slave::Impl> {
 public:
     Config                        cfg;
     std::shared_ptr<RegisterBank> bank;
-    mutable Stats                 stats;
+    /// 内部计数器：跨线程自增（不同客户端的回调在不同 io 线程上），必须原子。
+    /// 对外仍然返回可拷贝的 `Slave::Stats`（那是快照）。
+    struct StatsAtomic {
+        std::atomic<std::uint64_t> requests{0};
+        std::atomic<std::uint64_t> exceptions{0};
+        std::atomic<std::uint64_t> bad_frames{0};
+        std::atomic<std::uint64_t> rejected_clients{0};
+    };
+    StatsAtomic                   stats;
 
     // ---- 串口 ----
     std::shared_ptr<netmech::SerialPort> port;
+    std::uint32_t                        baud_rate = 9600;   ///< RTU 用；算 3.5 字符沉默
 
     // ---- TCP ----
     std::shared_ptr<netmech::Mechanism> mech;
@@ -124,10 +121,37 @@ public:
         m_cv.notify_all();
     }
 
+    /// 帧间"静默"阈值。
+    ///
+    /// Modbus over Serial Line §2.5.1.1：
+    ///   · 波特率 ≤ 19200：3.5 个字符时间；
+    ///   · 波特率 > 19200：固定 1.75 ms（规范就是这么定的，不是"1.5 字符"）。
+    ///
+    /// `cfg.silence_ms != 0` 时用显式值（调试/特殊硬件用）；`0` 表示按波特率算
+    /// —— 这是默认值，也是 `slave.hpp` 里承诺的语义。
+    ///
+    /// @note 以前 `run()` 直接拿 `cfg.silence_ms` 用，默认 0 ⇒ 收到字节立刻切帧，
+    ///       真串口上一帧会被切成多帧、CRC 全错。pty 测试一次到齐，掩盖了这个问题。
+    [[nodiscard]] std::chrono::microseconds frame_gap() const noexcept
+    {
+        if (cfg.silence_ms != 0) {
+            return std::chrono::milliseconds(cfg.silence_ms);
+        }
+        if (baud_rate == 0) {
+            return std::chrono::milliseconds(4);
+        }
+        if (baud_rate > 19200) {
+            return std::chrono::microseconds(1750);
+        }
+        // 3.5 字符 × 10 bit/字符（1 起始 + 8 数据 + 1 停止）
+        const double us = 3.5 * 10.0 * 1'000'000.0 / static_cast<double>(baud_rate);
+        return std::chrono::microseconds(static_cast<std::int64_t>(us + 0.5));
+    }
+
     /// 帧处理线程：等 silence，然后处理整帧。
     void run()
     {
-        const auto silence = std::chrono::milliseconds(cfg.silence_ms);
+        const auto silence = frame_gap();
 
         while (!m_stop.load()) {
             std::vector<std::uint8_t> frame;
@@ -173,7 +197,7 @@ public:
     {
         // 最短：地址(1) + 功能码(1) + CRC(2) = 4
         if (frame.size() < 4) {
-            ++stats.bad_frames;
+            stats.bad_frames.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
@@ -183,7 +207,7 @@ public:
         const std::uint16_t got = static_cast<std::uint16_t>(
             frame[data_len] | (static_cast<std::uint16_t>(frame[data_len + 1]) << 8));
         if (want != got) {
-            ++stats.bad_frames;
+            stats.bad_frames.fetch_add(1, std::memory_order_relaxed);
             return;   // 从站对 CRC 错的帧**不应答**
         }
 
@@ -206,7 +230,7 @@ public:
             return;   // 该 unit 未注册银行 ⇒ 等价于"总线上没有这台设备"，不应答
         }
 
-        ++stats.requests;
+        stats.requests.fetch_add(1, std::memory_order_relaxed);
 
         // ---- 解析 PDU ----
         const span<const std::uint8_t> pdu(frame.data() + 1, data_len - 1);
@@ -221,13 +245,13 @@ public:
         }
 
         if (resp.size() == 2 && (resp[0] & 0x80u)) {
-            ++stats.exceptions;
+            stats.exceptions.fetch_add(1, std::memory_order_relaxed);
         }
 
         // 🔴 响应地址必须回显**请求的 unit**，不能写 cfg.address ——
         //    多从站模式下 cfg.address 只是个"默认值"，回错地址会让主站把
         //    响应当噪声丢弃（主站按自己发出的 unit 校验应答）。
-        auto out = wrap_rtu(unit, span<const std::uint8_t>(resp.data(), resp.size()));
+        auto out = detail::wrap_rtu(unit, span<const std::uint8_t>(resp.data(), resp.size()));
         if (port) {
             port->write(netmech::ConstBuf{nullptr, out.data(), out.size()});
         }
@@ -239,6 +263,9 @@ public:
 
     /// TCP 的一个客户端会话。
     ///
+    /// Modbus TCP 的 ADU 上限：MBAP(7) + PDU 最大 253 = 260。
+    static constexpr std::size_t kMaxTcpAduLen = 260;
+
     /// 和 RTU 不同：不用 silence 切帧（MBAP 有长度字段），收到的字节只可能
     /// 是"半个帧"或"几个帧粘一起"，按长度字段循环切就行。
     class TcpSession final : public netmech::ConnHandler,
@@ -272,6 +299,13 @@ public:
             if (n > 0) {
                 m_rx.insert(m_rx.end(), static_cast<const std::uint8_t*>(buf.data),
                             static_cast<const std::uint8_t*>(buf.data) + n);
+                // ★ 缓冲上限：正常情况最多堆"两帧黏一起"（520 字节）。
+                //   超过说明对端在发自造帧（或我们切帧逻辑坏），直接断 ——
+                //   半帧永远到不齐时 m_rx 会无限涨，恶意客户端能靠这个占内存。
+                if (m_rx.size() > kMaxTcpAduLen * 2) {
+                    m_conn->close();
+                    return;
+                }
                 process();
             }
             start_read();
@@ -310,6 +344,13 @@ public:
                     return;
                 }
                 const std::size_t total = 6 + len;
+                // ★ 上限：Modbus TCP 的 ADU 最大 260（MBAP 7 + PDU 253）。
+                //   不查的话，一个 len=0xFFFF 的伪帧就能让我们等 64KB，
+                //   并把这期间的流量全堆在 m_rx 里。
+                if (total > kMaxTcpAduLen) {
+                    m_conn->close();
+                    return;
+                }
                 if (m_rx.size() < total) {
                     return;   // 还没收够
                 }
@@ -347,7 +388,7 @@ public:
                 out.insert(out.end(), resp.begin(), resp.end());
 
                 if (resp.size() == 2 && (resp[0] & 0x80u)) {
-                    ++m_owner->stats.exceptions;
+                    m_owner->stats.exceptions.fetch_add(1, std::memory_order_relaxed);
                 }
                 m_owner->write_conn(m_conn, std::move(out));
             }
@@ -392,7 +433,7 @@ public:
                 }
                 if (!ok) {
                     // 与其它计数器保持一致的写法（on_accept 由监听器串行驱动）
-                    ++owner->stats.rejected_clients;
+                    owner->stats.rejected_clients.fetch_add(1, std::memory_order_relaxed);
                     return nullptr;
                 }
             }
@@ -598,6 +639,8 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
     impl->cfg  = cfg;
     impl->bank = std::move(bank);
 
+    impl->baud_rate = baud_rate;
+
     netmech::SerialConfig sc;
     sc.device    = device;
     sc.baud_rate = baud_rate;
@@ -678,7 +721,17 @@ std::size_t Slave::client_count() const noexcept
 
 Slave::Stats Slave::stats() const noexcept
 {
-    return m_impl ? m_impl->stats : Stats{};
+    Stats out;
+    if (!m_impl) {
+        return out;
+    }
+    // 快照：字段各自原子读，**不保证四个数属于同一瞬间** —— 统计用途够了，
+    // 想要严格一致就得为它加锁，那是把锁塞进热路径，不值。
+    out.requests         = m_impl->stats.requests.load(std::memory_order_relaxed);
+    out.exceptions       = m_impl->stats.exceptions.load(std::memory_order_relaxed);
+    out.bad_frames       = m_impl->stats.bad_frames.load(std::memory_order_relaxed);
+    out.rejected_clients = m_impl->stats.rejected_clients.load(std::memory_order_relaxed);
+    return out;
 }
 
 void Slave::stop() noexcept

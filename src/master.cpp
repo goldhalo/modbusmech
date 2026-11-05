@@ -29,22 +29,6 @@ namespace modbusmech {
 
 namespace {
 
-/// 把 PDU 包成 RTU 帧。
-std::vector<std::uint8_t> wrap_rtu(std::uint8_t unit, span<const std::uint8_t> pdu)
-{
-    // 地址(1) | pdu | crc(2)
-    std::vector<std::uint8_t> frame(1 + pdu.size() + 2);
-    frame[0] = unit;
-    if (!pdu.empty()) {
-        std::memcpy(frame.data() + 1, pdu.data(), pdu.size());
-    }
-
-    const std::uint16_t crc = crc16(span<const std::uint8_t>(frame.data(), frame.size() - 2));
-    frame[frame.size() - 2] = static_cast<std::uint8_t>(crc & 0xFF);          // 低字节先
-    frame[frame.size() - 1] = static_cast<std::uint8_t>((crc >> 8) & 0xFF);
-    return frame;
-}
-
 } // namespace
 
 // =============================================================================
@@ -79,18 +63,19 @@ public:
             // 1. 清掉上次超时留下的半帧
             transport->flush_input();
 
-            // 2. 组帧并发送
-            std::vector<std::uint8_t> frame;
-            if (transport->is_rtu()) {
-                frame = wrap_rtu(cfg.unit, pdu);
-            } else {
-                // TCP 由 TcpTransport 自己加 MBAP（后面实现）
-                frame.assign(pdu.begin(), pdu.end());
-            }
-
-            ec = transport->send(span<const std::uint8_t>(frame.data(), frame.size()));
+            // 2. 发送（封装交给 transport：RTU 自己加地址+CRC，TCP 自己加 MBAP）
+            //
+            //    ★ unit 由这里**按调用传入**，不再让 transport 自己存一份 ——
+            //      以前 TCP 侧那个成员从未被赋值，恒为 1，cfg.unit != 1 时
+            //      发出去 unit=1、校验却按 cfg.unit，必然失败。
+            ec = transport->send(pdu, cfg.unit);
             if (ec) {
-                ++stats.timeouts;
+                ++stats.send_errors;   // 不是超时：别混进 timeouts
+                // 重试间隔：以前只有"等响应失败"才 sleep，发送失败会立刻重打，
+                // 串口写不进去时会连着撞。
+                if (attempt < cfg.retries && cfg.retry_delay.count() > 0) {
+                    std::this_thread::sleep_for(cfg.retry_delay);
+                }
                 continue;
             }
 
@@ -222,6 +207,14 @@ std::shared_ptr<Master> Master::create_rtu(const std::string& device,
 {
     ec.clear();
 
+    // ★ retries < 0 会让 transaction() 的重试循环一次都不执行，
+    //   于是 ec 是空的、resp 也是空的 —— 上层按"成功"去解析空响应，
+    //   报出来的是 frame_too_short，与真实原因（配置错）完全对不上。
+    if (cfg.retries < 0) {
+        ec = make_error_code(ModbusErrc::invalid_argument);
+        return nullptr;
+    }
+
     detail::RtuTransport::Config rc;
     rc.baud_rate = baud_rate;
 
@@ -243,6 +236,11 @@ std::shared_ptr<Master> Master::create_tcp(const std::string& host,
                                            std::error_code& ec)
 {
     ec.clear();
+
+    if (cfg.retries < 0) {
+        ec = make_error_code(ModbusErrc::invalid_argument);
+        return nullptr;
+    }
 
     auto tr = detail::TcpTransport::create(host, port, ec);
     if (!tr) {

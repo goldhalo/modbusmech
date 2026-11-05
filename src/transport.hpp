@@ -28,8 +28,20 @@ public:
 
     [[nodiscard]] virtual bool is_open() const noexcept = 0;
 
-    /// 发一帧（不含任何额外封装，RTU/TCP 各自已经加好了头/CRC）。
-    virtual std::error_code send(span<const std::uint8_t> frame) = 0;
+    /// 发一个**请求 PDU**（从功能码起，不含地址/MBAP/CRC）。
+    ///
+    /// 封装由各实现自己做：
+    ///   * RTU：`地址 + PDU + CRC16`；
+    ///   * TCP：`MBAP(tid/proto/len/unit) + PDU`。
+    ///
+    /// @param[in] pdu  请求 PDU
+    /// @param[in] unit 单元号 / 从站地址
+    ///
+    /// @note 以前这里收的是"已经封好的帧"，于是 TCP 侧的 unit 只能从
+    ///       transport 自己的成员取 —— 那个成员从未被赋值，恒为 1
+    ///       （`cfg.unit != 1` 时发出去的是 unit=1、校验却按 cfg.unit，
+    ///       必然失败）。改成按调用传入，从根上消掉这个状态。
+    virtual std::error_code send(span<const std::uint8_t> pdu, std::uint8_t unit) = 0;
 
     /// 收一帧完整的响应。
     ///
