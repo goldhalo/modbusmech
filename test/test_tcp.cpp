@@ -496,16 +496,21 @@ NETMECH_TEST(tcp_master_serves_multiple_units_on_one_connection)
 }
 
 // ---------------------------------------------------------------------------
-// 多线程并发轮询同一总线：内部串行化，不该串包
+// 多线程并发轮询：**由调用方串行化**（这是库推荐的用法）
+//
+// 库内部不加锁 —— 485 是半双工，串行化该发生在"谁先发"的决策上
+// （EAS 就是一条总线一个线程 + 优先级队列：采集低、控制高）；
+// Modbus TCP 有 MBAP 事务标识，协议上允许流水线，库加锁反而堵死这条路。
+// 所以这里演示的是**应用侧**怎么写：自己拿一把锁（或者用单线程 + 优先队列）。
 // ---------------------------------------------------------------------------
-NETMECH_TEST(tcp_master_concurrent_units_are_serialized)
+NETMECH_TEST(tcp_master_concurrent_polling_with_app_side_lock)
 {
     const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
-    auto bank1 = std::make_shared<Bank>(10);   // 值 = i * 10
-    auto bank2 = std::make_shared<Bank>(20);   // 值 = i * 20
+    auto bank1 = std::make_shared<Bank>(10);
+    auto bank2 = std::make_shared<Bank>(20);
 
     Slave::Config sc;
     sc.bank_for = [bank1, bank2](std::uint8_t unit) -> std::shared_ptr<RegisterBank> {
@@ -524,13 +529,19 @@ NETMECH_TEST(tcp_master_concurrent_units_are_serialized)
     auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
     REQUIRE(master != nullptr);
 
+    // ★ 应用侧的串行化：一把锁（真实系统里是"一个线程 + 优先级队列"）
+    std::mutex       bus_mtx;
     std::atomic<int> ok1{0};
     std::atomic<int> ok2{0};
 
     auto poll = [&](std::uint8_t unit, std::atomic<int>& ok) {
         for (int i = 0; i < 20; ++i) {
             std::vector<std::uint16_t> regs;
-            const Result r = master->read_holding_registers(unit, 5, 2, regs);
+            Result                     r;
+            {
+                std::lock_guard<std::mutex> lk(bus_mtx);   // ← 串行化在这里
+                r = master->read_holding_registers(unit, 5, 2, regs);
+            }
             if (r.ok() && regs.size() == 2u
                 && regs[0] == static_cast<std::uint16_t>(unit * 50)) {
                 ok.fetch_add(1);

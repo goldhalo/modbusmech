@@ -54,11 +54,6 @@ public:
     };
     StatsAtomic                        stats;
 
-    /// 请求串行化：一个 Master 一次只跑一个事务。
-    /// 物理上一条 485 总线 / 一个 TCP 连接也只能一问一答，锁住是对的；
-    /// 有了它，"带 unit 的重载"才真的可以多线程并发调用。
-    std::mutex                         txn_mtx;
-
     /// 发一个 PDU，收一个响应 PDU。
     ///
     /// @param[in]  pdu     请求 PDU
@@ -70,13 +65,10 @@ public:
         resp.clear();
         ec.clear();
 
-        // ★ 同一个 Master 的请求串行化。
-        //
-        //   物理上一条 485 总线 / 一个 TCP 连接本来就只能一问一答；如果两个
-        //   线程同时进来，帧会交错，谁都收不到完整响应。
-        //   有了这把锁，"带 unit 的重载"才真的可以多线程并发调用 ——
-        //   否则调用方还得自己在外面加锁，那就白改了。
-        std::lock_guard<std::mutex> lk(txn_mtx);
+        // ★ 这里**不加锁**：并发由调用方负责（见 master.hpp 的"并发"一节）。
+        //   本库替调用方加锁会挡住一些合法用法（比如应用自己按优先级排队、
+        //   或者在允许流水线的链路上自己控制节奏），而且"库替你串行化"这件事
+        //   一旦写进实现，调用方就很难察觉自己踩了并发。
 
         if (!transport || !transport->is_open()) {
             ec = make_error_code(ModbusErrc::not_connected);
