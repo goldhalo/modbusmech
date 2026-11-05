@@ -19,6 +19,8 @@
 #include <cstring>
 #include <thread>
 #include <memory>
+#include <atomic>
+#include <mutex>
 #include <vector>
 #include <cstdint>
 #include <string>
@@ -39,18 +41,42 @@ class Master::Impl {
 public:
     std::shared_ptr<detail::Transport> transport;
     Config                             cfg;
-    mutable Stats                      stats;
+
+    /// 内部计数器：`stats()` 是给别的线程看的，而计数器在工作线程上变 ——
+    /// 必须原子；对外仍然返回可拷贝的 `Master::Stats`（快照）。
+    struct StatsAtomic {
+        std::atomic<std::uint64_t> requests{0};
+        std::atomic<std::uint64_t> succeeded{0};
+        std::atomic<std::uint64_t> timeouts{0};
+        std::atomic<std::uint64_t> send_errors{0};
+        std::atomic<std::uint64_t> exceptions{0};
+        std::atomic<std::uint64_t> crc_errors{0};
+    };
+    StatsAtomic                        stats;
+
+    /// 请求串行化：一个 Master 一次只跑一个事务。
+    /// 物理上一条 485 总线 / 一个 TCP 连接也只能一问一答，锁住是对的；
+    /// 有了它，"带 unit 的重载"才真的可以多线程并发调用。
+    std::mutex                         txn_mtx;
 
     /// 发一个 PDU，收一个响应 PDU。
     ///
     /// @param[in]  pdu     请求 PDU
     /// @param[out] resp    响应 PDU（已剥掉 ADU 封装，含功能码）
     /// @param[out] ec      传输层错误
-    void transaction(span<const std::uint8_t> pdu, std::vector<std::uint8_t>& resp,
-                     std::error_code& ec)
+    void transaction(std::uint8_t unit, span<const std::uint8_t> pdu,
+                     std::vector<std::uint8_t>& resp, std::error_code& ec)
     {
         resp.clear();
         ec.clear();
+
+        // ★ 同一个 Master 的请求串行化。
+        //
+        //   物理上一条 485 总线 / 一个 TCP 连接本来就只能一问一答；如果两个
+        //   线程同时进来，帧会交错，谁都收不到完整响应。
+        //   有了这把锁，"带 unit 的重载"才真的可以多线程并发调用 ——
+        //   否则调用方还得自己在外面加锁，那就白改了。
+        std::lock_guard<std::mutex> lk(txn_mtx);
 
         if (!transport || !transport->is_open()) {
             ec = make_error_code(ModbusErrc::not_connected);
@@ -58,7 +84,7 @@ public:
         }
 
         for (int attempt = 0; attempt <= cfg.retries; ++attempt) {
-            ++stats.requests;
+            stats.requests.fetch_add(1, std::memory_order_relaxed);
 
             // 1. 清掉上次超时留下的半帧
             transport->flush_input();
@@ -68,9 +94,9 @@ public:
             //    ★ unit 由这里**按调用传入**，不再让 transport 自己存一份 ——
             //      以前 TCP 侧那个成员从未被赋值，恒为 1，cfg.unit != 1 时
             //      发出去 unit=1、校验却按 cfg.unit，必然失败。
-            ec = transport->send(pdu, cfg.unit);
+            ec = transport->send(pdu, unit);
             if (ec) {
-                ++stats.send_errors;   // 不是超时：别混进 timeouts
+                stats.send_errors.fetch_add(1, std::memory_order_relaxed);   // 不是超时：别混进 timeouts
                 // 重试间隔：以前只有"等响应失败"才 sleep，发送失败会立刻重打，
                 // 串口写不进去时会连着撞。
                 if (attempt < cfg.retries && cfg.retry_delay.count() > 0) {
@@ -81,12 +107,12 @@ public:
 
             // 3. 收响应
             std::vector<std::uint8_t> adu;
-            ec = transport->receive(adu, cfg.timeout, cfg.unit);
+            ec = transport->receive(adu, cfg.timeout, unit);
             if (ec) {
                 if (ec == ModbusErrc::crc_mismatch) {
-                    ++stats.crc_errors;
+                    stats.crc_errors.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    ++stats.timeouts;
+                    stats.timeouts.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (attempt < cfg.retries) {
                     std::this_thread::sleep_for(cfg.retry_delay);
@@ -110,7 +136,7 @@ public:
     }
 
 /// 读类请求的公共流程（01/02/03/04）。
-    Result do_read(Function f, std::uint16_t address,
+    Result do_read(Function f, std::uint8_t unit, std::uint16_t address,
                    std::uint16_t count, std::vector<bool>* bits,
                    std::vector<std::uint16_t>* regs)
 {
@@ -129,7 +155,7 @@ public:
     }
 
     std::vector<std::uint8_t> resp;
-    transaction(span<const std::uint8_t>(pdu.data(), pdu.size()), resp, ec);
+    transaction(unit, span<const std::uint8_t>(pdu.data(), pdu.size()), resp, ec);
     if (ec) {
         r.ec = ec;
         return r;
@@ -146,7 +172,7 @@ public:
         return r;
     }
     if (ex != Exception::none) {
-        ++stats.exceptions;
+        stats.exceptions.fetch_add(1, std::memory_order_relaxed);
         r.exception = ex;
         return r;
     }
@@ -157,19 +183,19 @@ public:
     if (regs) {
         *regs = std::move(local_regs);
     }
-    ++stats.succeeded;
+    stats.succeeded.fetch_add(1, std::memory_order_relaxed);
     return r;
 }
 
 /// 写类请求的公共流程（05/06/0F/10）。
-    Result do_write(Function f, std::uint16_t address,
+    Result do_write(Function f, std::uint8_t unit, std::uint16_t address,
                     std::uint16_t count, const std::vector<std::uint8_t>& pdu)
 {
     Result r;
     std::error_code ec;
 
     std::vector<std::uint8_t> resp;
-    transaction(span<const std::uint8_t>(pdu.data(), pdu.size()), resp, ec);
+    transaction(unit, span<const std::uint8_t>(pdu.data(), pdu.size()), resp, ec);
     if (ec) {
         r.ec = ec;
         return r;
@@ -183,11 +209,11 @@ public:
         return r;
     }
     if (ex != Exception::none) {
-        ++stats.exceptions;
+        stats.exceptions.fetch_add(1, std::memory_order_relaxed);
         r.exception = ex;
         return r;
     }
-    ++stats.succeeded;
+    stats.succeeded.fetch_add(1, std::memory_order_relaxed);
     return r;
 }
 
@@ -273,7 +299,18 @@ void Master::set_unit(std::uint8_t unit) noexcept
 
 Master::Stats Master::stats() const noexcept
 {
-    return m_impl ? m_impl->stats : Stats{};
+    Stats out;
+    if (!m_impl) {
+        return out;
+    }
+    // 快照：字段各自原子读，不保证属于同一瞬间（统计用途够了）。
+    out.requests    = m_impl->stats.requests.load(std::memory_order_relaxed);
+    out.succeeded   = m_impl->stats.succeeded.load(std::memory_order_relaxed);
+    out.timeouts    = m_impl->stats.timeouts.load(std::memory_order_relaxed);
+    out.send_errors = m_impl->stats.send_errors.load(std::memory_order_relaxed);
+    out.exceptions  = m_impl->stats.exceptions.load(std::memory_order_relaxed);
+    out.crc_errors  = m_impl->stats.crc_errors.load(std::memory_order_relaxed);
+    return out;
 }
 
 void Master::close() noexcept
@@ -293,7 +330,7 @@ Result Master::read_coils(std::uint16_t address, std::uint16_t count,
     if (!m_impl) {
         return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
     }
-    return m_impl->do_read(Function::read_coils, address, count, &out, nullptr);
+    return m_impl->do_read(Function::read_coils, m_impl->cfg.unit, address, count, &out, nullptr);
 }
 
 Result Master::read_discrete_inputs(std::uint16_t address, std::uint16_t count,
@@ -302,7 +339,7 @@ Result Master::read_discrete_inputs(std::uint16_t address, std::uint16_t count,
     if (!m_impl) {
         return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
     }
-    return m_impl->do_read(Function::read_discrete_inputs, address, count,
+    return m_impl->do_read(Function::read_discrete_inputs, m_impl->cfg.unit, address, count,
                    &out, nullptr);
 }
 
@@ -312,7 +349,7 @@ Result Master::read_holding_registers(std::uint16_t address, std::uint16_t count
     if (!m_impl) {
         return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
     }
-    return m_impl->do_read(Function::read_holding_registers, address, count,
+    return m_impl->do_read(Function::read_holding_registers, m_impl->cfg.unit, address, count,
                    nullptr, &out);
 }
 
@@ -322,7 +359,7 @@ Result Master::read_input_registers(std::uint16_t address, std::uint16_t count,
     if (!m_impl) {
         return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
     }
-    return m_impl->do_read(Function::read_input_registers, address, count,
+    return m_impl->do_read(Function::read_input_registers, m_impl->cfg.unit, address, count,
                    nullptr, &out);
 }
 
@@ -336,12 +373,14 @@ Result Master::write_single_coil(std::uint16_t address, bool value)
         return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
     }
     std::vector<std::uint8_t> pdu;
-    const auto ec = encode_pdu(Function::write_single_coil,
-                               WriteCoilRequest{address, value}, pdu);
+    WriteCoilRequest req;
+    req.address = address;
+    req.value   = value;
+    const auto ec = encode_pdu(Function::write_single_coil, req, pdu);
     if (ec) {
         return Result{ec, Exception::none};
     }
-    return m_impl->do_write(Function::write_single_coil, address, 1, pdu);
+    return m_impl->do_write(Function::write_single_coil, m_impl->cfg.unit, address, 1, pdu);
 }
 
 Result Master::write_single_register(std::uint16_t address, std::uint16_t value)
@@ -350,12 +389,14 @@ Result Master::write_single_register(std::uint16_t address, std::uint16_t value)
         return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
     }
     std::vector<std::uint8_t> pdu;
-    const auto ec = encode_pdu(Function::write_single_register,
-                               WriteRegisterRequest{address, value}, pdu);
+    WriteRegisterRequest req;
+    req.address = address;
+    req.value   = value;
+    const auto ec = encode_pdu(Function::write_single_register, req, pdu);
     if (ec) {
         return Result{ec, Exception::none};
     }
-    return m_impl->do_write(Function::write_single_register, address, 1, pdu);
+    return m_impl->do_write(Function::write_single_register, m_impl->cfg.unit, address, 1, pdu);
 }
 
 Result Master::write_multiple_coils(std::uint16_t address,
@@ -372,7 +413,7 @@ Result Master::write_multiple_coils(std::uint16_t address,
     if (ec) {
         return Result{ec, Exception::none};
     }
-    return m_impl->do_write(Function::write_multiple_coils, address,
+    return m_impl->do_write(Function::write_multiple_coils, m_impl->cfg.unit, address,
                     static_cast<std::uint16_t>(values.size()), pdu);
 }
 
@@ -390,8 +431,122 @@ Result Master::write_multiple_registers(std::uint16_t address,
     if (ec) {
         return Result{ec, Exception::none};
     }
-    return m_impl->do_write(Function::write_multiple_registers, address,
+    return m_impl->do_write(Function::write_multiple_registers, m_impl->cfg.unit, address,
                     static_cast<std::uint16_t>(values.size()), pdu);
+}
+
+// =============================================================================
+//  读 / 写（显式 unit：一条总线多从站）
+// =============================================================================
+
+Result Master::read_coils(std::uint8_t unit, std::uint16_t address,
+                          std::uint16_t count, std::vector<bool>& out)
+{
+    if (!m_impl) {
+        return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
+    }
+    return m_impl->do_read(Function::read_coils, unit, address, count, &out, nullptr);
+}
+
+Result Master::read_discrete_inputs(std::uint8_t unit, std::uint16_t address,
+                                    std::uint16_t count, std::vector<bool>& out)
+{
+    if (!m_impl) {
+        return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
+    }
+    return m_impl->do_read(Function::read_discrete_inputs, unit, address, count, &out,
+                           nullptr);
+}
+
+Result Master::read_holding_registers(std::uint8_t unit, std::uint16_t address,
+                                      std::uint16_t count,
+                                      std::vector<std::uint16_t>& out)
+{
+    if (!m_impl) {
+        return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
+    }
+    return m_impl->do_read(Function::read_holding_registers, unit, address, count,
+                           nullptr, &out);
+}
+
+Result Master::read_input_registers(std::uint8_t unit, std::uint16_t address,
+                                    std::uint16_t count,
+                                    std::vector<std::uint16_t>& out)
+{
+    if (!m_impl) {
+        return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
+    }
+    return m_impl->do_read(Function::read_input_registers, unit, address, count,
+                           nullptr, &out);
+}
+
+Result Master::write_single_coil(std::uint8_t unit, std::uint16_t address, bool value)
+{
+    if (!m_impl) {
+        return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
+    }
+    std::vector<std::uint8_t> pdu;
+    WriteCoilRequest req;
+    req.address = address;
+    req.value   = value;
+    const auto ec = encode_pdu(Function::write_single_coil, req, pdu);
+    if (ec) {
+        return Result{ec, Exception::none};
+    }
+    return m_impl->do_write(Function::write_single_coil, unit, address, 1, pdu);
+}
+
+Result Master::write_single_register(std::uint8_t unit, std::uint16_t address,
+                                     std::uint16_t value)
+{
+    if (!m_impl) {
+        return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
+    }
+    std::vector<std::uint8_t> pdu;
+    WriteRegisterRequest req;
+    req.address = address;
+    req.value   = value;
+    const auto ec = encode_pdu(Function::write_single_register, req, pdu);
+    if (ec) {
+        return Result{ec, Exception::none};
+    }
+    return m_impl->do_write(Function::write_single_register, unit, address, 1, pdu);
+}
+
+Result Master::write_multiple_coils(std::uint8_t unit, std::uint16_t address,
+                                    const std::vector<bool>& values)
+{
+    if (!m_impl) {
+        return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
+    }
+    std::vector<std::uint8_t> pdu;
+    WriteCoilsRequest req;
+    req.address = address;
+    req.values  = values;
+    const auto ec = encode_pdu(Function::write_multiple_coils, req, pdu);
+    if (ec) {
+        return Result{ec, Exception::none};
+    }
+    return m_impl->do_write(Function::write_multiple_coils, unit, address,
+                            static_cast<std::uint16_t>(values.size()), pdu);
+}
+
+Result Master::write_multiple_registers(std::uint8_t unit, std::uint16_t address,
+                                        const std::vector<std::uint16_t>& values)
+{
+    if (!m_impl) {
+        return Result{make_error_code(ModbusErrc::not_connected), Exception::none};
+    }
+    std::vector<std::uint8_t> pdu;
+    WriteRegistersRequest req;
+    req.address = address;
+    req.values  = values;
+    const auto ec = encode_pdu(Function::write_multiple_registers, req, pdu);
+    if (ec) {
+        return Result{ec, Exception::none};
+    }
+    return m_impl->do_write(Function::write_multiple_registers, unit, address,
+                            static_cast<std::uint16_t>(values.size()), pdu);
 }
 
 } // namespace modbusmech

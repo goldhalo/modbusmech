@@ -73,9 +73,27 @@ public:
 
     // ---- 读写 ----
     //
-    // 全部阻塞。返回值里的 Result 区分"传输失败"和"从站异常"。
+    // 全部**阻塞**。返回值里的 Result 区分"传输失败"和"从站异常"。
     // 读成功时 out 被填充；失败时 out 内容未定义。
+    //
+    // @par 两组重载：带 unit 与不带 unit
+    //  不带 unit 的用 `Config::unit`（单设备场景，最常用）；
+    //  带 unit 的**每次请求显式指定**（`read_coils(unit, address, count, out)`）。
+    //
+    //  ★ 为什么需要带 unit 的那组
+    //   一条 485 总线通常挂几十台设备（现场典型：50 块电表 + 1 台综保）。
+    //   如果只能靠 `set_unit()` 改状态，那么"改 unit + 发请求"这两步之间必须
+    //   自己加锁 —— 任何一处忘了，两路设备就会串包。
+    //   带 unit 的重载把 unit 变成**参数**：不碰共享状态，
+    //   所以同一个 Master 可以在多个线程里并发调用（内部按请求串行化）。
+    //
+    // @par 并发
+    //  同一个 Master 的请求会在内部**串行执行**（物理上一条总线/一个连接本来
+    //  也只能一问一答）。多线程调用是安全的，但不会更快 —— 想并行请按端口建
+    //  多个 Master。
 
+    /// @name 读（使用 Config::unit）
+    /// @{
     Result read_coils(std::uint16_t address, std::uint16_t count,
                       std::vector<bool>& out);
 
@@ -97,6 +115,30 @@ public:
 
     Result write_multiple_registers(std::uint16_t address,
                                     const std::vector<std::uint16_t>& values);
+    /// @}
+
+    /// @name 读（显式 unit：一条总线多从站时用这组）
+    /// @{
+    Result read_coils(std::uint8_t unit, std::uint16_t address,
+                      std::uint16_t count, std::vector<bool>& out);
+    Result read_discrete_inputs(std::uint8_t unit, std::uint16_t address,
+                                std::uint16_t count, std::vector<bool>& out);
+    Result read_holding_registers(std::uint8_t unit, std::uint16_t address,
+                                  std::uint16_t count, std::vector<std::uint16_t>& out);
+    Result read_input_registers(std::uint8_t unit, std::uint16_t address,
+                                std::uint16_t count, std::vector<std::uint16_t>& out);
+    /// @}
+
+    /// @name 写（显式 unit）
+    /// @{
+    Result write_single_coil(std::uint8_t unit, std::uint16_t address, bool value);
+    Result write_single_register(std::uint8_t unit, std::uint16_t address,
+                                 std::uint16_t value);
+    Result write_multiple_coils(std::uint8_t unit, std::uint16_t address,
+                                const std::vector<bool>& values);
+    Result write_multiple_registers(std::uint8_t unit, std::uint16_t address,
+                                    const std::vector<std::uint16_t>& values);
+    /// @}
 
     // ---- 状态 ----
 

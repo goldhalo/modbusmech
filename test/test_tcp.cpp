@@ -34,10 +34,12 @@ using namespace std::chrono_literals;
 /// 100 个保持寄存器，值 = i * 10。
 class Bank final : public RegisterBank {
 public:
-    Bank() : m_regs(100, 0)
+    /// @param[in] factor 第 i 个寄存器的值 = i * factor
+    ///                   （多 unit 的用例靠它区分"这是哪台设备的数据"）
+    explicit Bank(int factor = 10) : m_regs(100, 0)
     {
         for (std::size_t i = 0; i < m_regs.size(); ++i) {
-            m_regs[i] = static_cast<std::uint16_t>(i * 10);
+            m_regs[i] = static_cast<std::uint16_t>(i * factor);
         }
     }
 
@@ -425,6 +427,124 @@ NETMECH_TEST(tcp_master_uses_configured_unit)
     regs.clear();
     const Result r2 = master->read_holding_registers(5, 2, regs);
     CHECK(!r2.ok());
+
+    master->close();
+    slave->stop();
+}
+
+// ---------------------------------------------------------------------------
+// 一个 Master / 一条连接，服务多个 unit（一条 485 总线挂多台设备的模型）
+//
+// 这是"引入项目"时最关键的用法：现场一条总线挂 50 块表，不能给每块表都开一条
+// 串口 —— 只能一个 Master，按 unit 轮着问。
+// 带 unit 的重载把 unit 变成参数（不碰 set_unit 的共享状态），
+// 所以下面这个用例里两次调用拿到的是各自设备的寄存器。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tcp_master_serves_multiple_units_on_one_connection)
+{
+    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    REQUIRE(port_opt.has_value());
+    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+
+    // 两台"设备"：unit=1 的值是 10x，unit=2 的值是 20x
+    auto bank1 = std::make_shared<Bank>(10);   // 值 = i * 10
+    auto bank2 = std::make_shared<Bank>(20);   // 值 = i * 20
+
+    Slave::Config sc;
+    sc.bank_for = [bank1, bank2](std::uint8_t unit) -> std::shared_ptr<RegisterBank> {
+        if (unit == 1) {
+            return bank1;
+        }
+        if (unit == 2) {
+            return bank2;
+        }
+        return nullptr;
+    };
+
+    std::error_code ec;
+    auto slave = Slave::create_tcp(port, sc, bank1, ec);
+    REQUIRE(slave != nullptr);
+
+    Master::Config mc;
+    mc.unit    = 1;          // 默认 unit，带 unit 的重载不使用它
+    mc.timeout = 1000ms;
+    mc.retries = 0;
+
+    auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+    REQUIRE(master != nullptr);
+
+    std::vector<std::uint16_t> regs;
+
+    // unit=1
+    auto r1 = master->read_holding_registers(std::uint8_t{1}, 5, 2, regs);
+    CHECK_MSG(r1.ok(), r1.describe().c_str());
+    REQUIRE(regs.size() == 2u);
+    CHECK_EQ(regs[0], 50);
+
+    // unit=2（同一条连接）
+    auto r2 = master->read_holding_registers(std::uint8_t{2}, 5, 2, regs);
+    CHECK_MSG(r2.ok(), r2.describe().c_str());
+    REQUIRE(regs.size() == 2u);
+    CHECK_EQ(regs[0], 100);
+
+    // unit=3 不存在：从站静默丢弃 → 超时
+    auto r3 = master->read_holding_registers(std::uint8_t{3}, 5, 2, regs);
+    CHECK(!r3.ok());
+
+    master->close();
+    slave->stop();
+}
+
+// ---------------------------------------------------------------------------
+// 多线程并发轮询同一总线：内部串行化，不该串包
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tcp_master_concurrent_units_are_serialized)
+{
+    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    REQUIRE(port_opt.has_value());
+    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+
+    auto bank1 = std::make_shared<Bank>(10);   // 值 = i * 10
+    auto bank2 = std::make_shared<Bank>(20);   // 值 = i * 20
+
+    Slave::Config sc;
+    sc.bank_for = [bank1, bank2](std::uint8_t unit) -> std::shared_ptr<RegisterBank> {
+        return unit == 1 ? bank1 : (unit == 2 ? bank2 : nullptr);
+    };
+
+    std::error_code ec;
+    auto slave = Slave::create_tcp(port, sc, bank1, ec);
+    REQUIRE(slave != nullptr);
+
+    Master::Config mc;
+    mc.unit    = 1;
+    mc.timeout = 1000ms;
+    mc.retries = 0;
+
+    auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+    REQUIRE(master != nullptr);
+
+    std::atomic<int> ok1{0};
+    std::atomic<int> ok2{0};
+
+    auto poll = [&](std::uint8_t unit, std::atomic<int>& ok) {
+        for (int i = 0; i < 20; ++i) {
+            std::vector<std::uint16_t> regs;
+            const Result r = master->read_holding_registers(unit, 5, 2, regs);
+            if (r.ok() && regs.size() == 2u
+                && regs[0] == static_cast<std::uint16_t>(unit * 50)) {
+                ok.fetch_add(1);
+            }
+        }
+    };
+
+    std::thread t1([&] { poll(1, ok1); });
+    std::thread t2([&] { poll(2, ok2); });
+    t1.join();
+    t2.join();
+
+    CHECK_EQ(ok1.load(), 20);
+    CHECK_EQ(ok2.load(), 20);
 
     master->close();
     slave->stop();
