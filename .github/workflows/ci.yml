@@ -204,6 +204,53 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # TSan（数据竞争）
+  #
+  # ASan/UBSan 抓不到数据竞争：两个线程同时写一块内存，读到的值"碰巧对"时
+  # 一点症状都没有。本仓的 io 回调跑在 netmech 的线程池上（每个连接一条），
+  # 一旦哪里少了一次同步，只有 TSan 看得见。
+  #
+  # 第一次开这个 job 就抓到一处：`TcpTransport::create` 轮询 connect 期间，
+  # io 线程的 `on_open` 与调用线程的 `create()` 同时写 `m_conn`（同一个
+  # shared_ptr，无同步）。修完后是 0 —— 所以这里**不留 suppression**。
+  #
+  # 注意 halt_on_error=1：一报就红，不给自己"攒一堆再看"的余地。
+  # ---------------------------------------------------------------------------
+  tsan:
+    name: TSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: 检出（含 netmech submodule）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: 配置（Debug + TSan）
+        run: |
+          cmake -S . -B build-tsan -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1" \
+                -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1" \
+                -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
+                -DMODBUSMECH_BUILD_TESTS=ON \
+                -DMODBUSMECH_BUILD_EXAMPLES=OFF
+
+      - name: 构建
+        run: cmake --build build-tsan --parallel
+
+      - name: 测试（报告任何数据竞争即失败）
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build-tsan --output-on-failure --timeout 300
+
+  # ---------------------------------------------------------------------------
   # 质量门禁
   # ---------------------------------------------------------------------------
   quality:
@@ -274,82 +321,3 @@ jobs:
           done
           if [ $FAIL -eq 1 ]; then exit 1; fi
           echo "✅ 全部头文件自包含"
-
-  # ---------------------------------------------------------------------------
-  # ASan + UBSan / TSan
-  #
-  # 为什么补这两个：本仓的 bug 有两类在普通 Debug/Release 下**完全没症状** ——
-  #   · RTU 读类响应只等到 2 字节就算长度（9600bps 真串口必然分次到达）：
-  #     时序问题，只有真串口/慢速链路才暴露；
-  #   · TcpTransport::create 轮询 connect 期间跨线程写 shared_ptr：
-  #     数据竞争，读到的值"碰巧对"时什么都看不出来。
-  # 后者就是 TSan 抓出来的（报在 create() 那两行上）。现在两者都是 0。
-  # ---------------------------------------------------------------------------
-  sanitizers:
-    name: ASan + UBSan
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    steps:
-      - name: 检出（含 netmech submodule）
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: 安装工具
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++
-
-      - name: 配置（Debug + ASan/UBSan）
-        run: |
-          cmake -S . -B build-san -G Ninja \
-                -DCMAKE_BUILD_TYPE=Debug \
-                -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
-                -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
-                -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
-                -DMODBUSMECH_BUILD_TESTS=ON
-
-      - name: 构建
-        run: cmake --build build-san --parallel
-
-      - name: 测试
-        env:
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest --test-dir build-san --output-on-failure --timeout 300
-
-  tsan:
-    name: TSan
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-
-    steps:
-      - name: 检出（含 netmech submodule）
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: 安装工具
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++
-
-      - name: 配置（Debug + TSan）
-        run: |
-          cmake -S . -B build-tsan -G Ninja \
-                -DCMAKE_BUILD_TYPE=Debug \
-                -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1" \
-                -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1" \
-                -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
-                -DMODBUSMECH_BUILD_TESTS=ON \
-                -DMODBUSMECH_BUILD_EXAMPLES=OFF
-
-      - name: 构建
-        run: cmake --build build-tsan --parallel
-
-      - name: 测试（报告任何数据竞争即失败）
-        env:
-          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
-        run: ctest --test-dir build-tsan --output-on-failure --timeout 300
-
