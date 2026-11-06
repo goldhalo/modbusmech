@@ -338,13 +338,22 @@ void TcpTransport::dispatch_frame(std::uint16_t tid, std::uint8_t unit,
         std::lock_guard<std::mutex> lk(m_pending_mtx);
         auto it = m_pending.find(tid);
         if (it == m_pending.end()) {
-            return;   // 迟到的响应（该事务已超时/已放弃）→ 丢弃
+            return;   // 迟到的响应（该事务已超时/已放弃/已被取走）→ 丢弃
         }
         p = it->second;
-        m_pending.erase(it);
+        // ★ 这里**不**把条目从表里删掉（只把结果写进 Pending）——由 receive()
+        //   取走结果后负责删除。以前在这里 erase，有一个致命窗口：
+        //   响应可能比调用线程更早到达（loopback + Release + 多线程时很常见），
+        //   dispatch 先删表，随后 receive() 按 tid 再查表就查不到 →
+        //   误报 not_connected，表现为"并发/多事务场景偶发丢几笔"。
     }
     {
         std::lock_guard<std::mutex> lk(p->mtx);
+        if (p->done) {
+            // 这一笔已经被别的路径收尾（收到过响应，或连接先失败）。
+            // "先完成者胜"：不覆盖，避免把成功结果改写成错误。
+            return;
+        }
         if (p->unit != unit) {
             p->ec = make_error_code(ModbusErrc::bad_unit_id);
         } else {
@@ -357,19 +366,33 @@ void TcpTransport::dispatch_frame(std::uint16_t tid, std::uint8_t unit,
 
 void TcpTransport::fail_all(const std::error_code& ec) noexcept
 {
-    std::unordered_map<std::uint16_t, std::shared_ptr<Pending>> victims;
+    // ★ 只把错误写进各个 Pending，**不清表**：结果由各自的 receive() 取走，
+    //   取走时再摘除。和 dispatch_frame 同理 —— 清表会让"响应/关闭先到、
+    //   receive() 后到"的路径查不到条目而误报 not_connected。
+    std::vector<std::shared_ptr<Pending>> victims;
     {
         std::lock_guard<std::mutex> lk(m_pending_mtx);
-        victims.swap(m_pending);
+        victims.reserve(m_pending.size());
+        for (auto& kv : m_pending) {
+            victims.push_back(kv.second);
+        }
     }
-    for (auto& kv : victims) {
-        const std::shared_ptr<Pending>& p = kv.second;
+    for (const std::shared_ptr<Pending>& p : victims) {
+        bool notify = false;
         {
             std::lock_guard<std::mutex> lk(p->mtx);
-            p->ec   = ec;
-            p->done = true;
+            // ★ 已完成的不覆盖：短连接设备"响应 + 关闭"几乎同时到达，
+            //   响应已经带着 PDU 完成了这一笔，这里再写 not_connected 会把
+            //   **成功改写成失败**（Windows Release 上实测会偶发）。
+            if (!p->done) {
+                p->ec   = ec;
+                p->done = true;
+                notify   = true;
+            }
         }
-        p->cv.notify_all();
+        if (notify) {
+            p->cv.notify_all();
+        }
     }
 }
 
@@ -454,10 +477,14 @@ std::error_code TcpTransport::receive(std::vector<std::uint8_t>& out,
             }
         }
     }
-    if (!completed) {
-        // 超时：把这一笔从在途表摘掉。之后到达的响应会因"查不到 tid"被丢弃。
+    // ★ 无论成功、失败还是超时，**由本线程**把这一笔从在途表摘掉：
+    //   Pending 的所有权在 send() → receive() 之间是唯一的一对一关系。
+    {
         std::lock_guard<std::mutex> lk(m_pending_mtx);
         m_pending.erase(tid);
+    }
+    if (!completed) {
+        // 超时：之后到达的响应会因"查不到 tid"被丢弃。
         return make_error_code(ModbusErrc::timeout);
     }
     return result;

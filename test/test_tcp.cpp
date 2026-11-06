@@ -33,6 +33,17 @@ using namespace netmech_test;
 
 namespace {
 
+// 【诊断用】每个用例换一个端口：验证"端口复用"是否是 Windows Release 偶发失败的根因。
+inline std::optional<std::uint16_t> next_free_test_port()
+{
+    // 每个用例从轮换的起点开始扫，避免所有用例都挤在 40000 这个端口上
+    // （Windows 上快速"关掉重建同一个端口"会撞上 TIME_WAIT/关闭时序）。
+    static std::atomic<std::uint16_t> n{0};
+    const std::uint16_t base =
+        static_cast<std::uint16_t>(40000 + (n.fetch_add(1) * 8) % 800);
+    return netmech::find_free_port_run(base, 50000, 1, 1);
+}
+
 using namespace std::chrono_literals;
 
 /// 100 个保持寄存器，值 = i * 10。
@@ -92,7 +103,7 @@ private:
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_read_holding_registers)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -129,7 +140,7 @@ NETMECH_TEST(tcp_master_read_holding_registers)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_transaction_ids_increment)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -163,7 +174,7 @@ NETMECH_TEST(tcp_transaction_ids_increment)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_write_single_register)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -199,7 +210,7 @@ NETMECH_TEST(tcp_write_single_register)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_exception_illegal_address)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -233,7 +244,7 @@ NETMECH_TEST(tcp_exception_illegal_address)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_multiple_clients)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -287,7 +298,7 @@ NETMECH_TEST(tcp_multiple_clients)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -340,7 +351,7 @@ NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_authorize_allows_known_peer)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -391,7 +402,7 @@ NETMECH_TEST(tcp_slave_authorize_allows_known_peer)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_uses_configured_unit)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -446,7 +457,7 @@ NETMECH_TEST(tcp_master_uses_configured_unit)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_serves_multiple_units_on_one_connection)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -509,7 +520,7 @@ NETMECH_TEST(tcp_master_serves_multiple_units_on_one_connection)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_concurrent_polling_with_app_side_lock)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -683,7 +694,7 @@ OneShotServer start_oneshot_server(std::uint16_t port)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_auto_reconnect_short_connection)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -721,7 +732,7 @@ NETMECH_TEST(tcp_master_auto_reconnect_short_connection)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_reconnect_disabled_reports_error)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -760,7 +771,7 @@ NETMECH_TEST(tcp_master_reconnect_disabled_reports_error)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_idle_timeout_closes_idle_connection)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -806,7 +817,7 @@ NETMECH_TEST(tcp_slave_idle_timeout_closes_idle_connection)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_max_clients_rejects_extra)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -851,7 +862,7 @@ NETMECH_TEST(tcp_slave_max_clients_rejects_extra)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_pipeline_allows_concurrent_requests)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -908,7 +919,7 @@ NETMECH_TEST(tcp_master_pipeline_allows_concurrent_requests)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_address_filter_drops_other_units)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -1037,7 +1048,7 @@ struct AsyncProbe {
 // ---------------------------------------------------------------------------
 NETMECH_TEST(async_master_read_holding_registers)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 
@@ -1079,7 +1090,7 @@ NETMECH_TEST(async_master_read_holding_registers)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(async_master_timeout_callback_fires)
 {
-    const auto port_opt = netmech::find_free_port_run(40000, 50000, 1, 1);
+    const auto port_opt = next_free_test_port();
     REQUIRE(port_opt.has_value());
     const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
 

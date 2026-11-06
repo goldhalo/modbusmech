@@ -69,6 +69,17 @@
 - 从站会话引用环导致 `client_count()` 永不归零
 - TCP 从站不校验 `Config::addresses`（配了 `--units` 也不生效）
 - 对端关闭时已收到的完整响应被丢弃（短连接设备随机超时）
+- **TCP 事务在并发/短连接下偶发误报 `not_connected`**（CI Windows/MSVC/Release 暴露）：
+  根因两处，都在 `TcpTransport` 的 `Pending` 生命周期 ——
+  ① `dispatch_frame` 收到响应就按 tid 删表，而 `receive()` 之后还要按 tid 再查一次，
+  响应比调用线程先到时查不到 → 误报未连接（并发/流水线/多事务场景丢笔）；
+  ② `fail_all` 会把**已经收到响应**的 `Pending` 改写成 `not_connected`，
+  短连接设备"回完就断"时响应与关闭几乎同时到达，成功被改写成失败。
+  修复：`Pending` 留在表里、由 `receive()` 取走结果后删除（成功/失败/超时三条路径一致）；
+  `dispatch_frame` 与 `fail_all` 统一遵守"先完成者胜"（`done` 已置位不再覆盖）。
+- 测试：TCP 用例改为 `next_free_test_port()`（每个用例从轮换起点探测端口），
+  不再全部挤在 40000 上 —— Windows 上反复重建同一端口会撞上关闭时序，
+  会掩盖真实问题。
 
 ---
 
