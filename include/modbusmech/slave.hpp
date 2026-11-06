@@ -18,6 +18,7 @@
 // =============================================================================
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -38,43 +39,65 @@ namespace modbusmech {
 /// 从站的寄存器访问接口。**应用实现这个**。
 ///
 /// 每个方法返回 false = 该地址不存在 → 库自动回 `illegal_data_address`。
+///
+/// @par 为什么要传 `unit`
+///   Modbus 的请求帧里带 unit（RTU 叫从站地址、TCP 叫 Unit ID）。库用它做两件
+///   事：① 判断本实例是否应答（`Config::accepts`）；② 选寄存器组
+///   （`Config::bank_for`）。
+///   但**只**靠这两步不够：做协议透传/网关时，一个 bank 要同时服务多个 unit，
+///   必须知道"这一帧是哪个设备要的"才能转发或按设备取值。协议本身不要求从站
+///   区分，但现场大量透传类应用需要它，所以这里把 `unit` 直接作为参数传进来。
+///
+///   · 正常从站：所有 unit 共用一个 bank 时，忽略这个参数即可；
+///   · 多设备/透传：按 `unit` 分派（此时通常配合 `Config::bank_for` 或单 bank
+///     内部按 unit 维护多份数据）。
+///
+/// @note `unit == 0` 在 RTU 上表示**广播**（执行但不回应）；TCP 没有广播概念，
+///       `unit == 0` 会当作普通地址处理。需要区分时自己判 `unit == 0`。
 class RegisterBank {
 public:
     virtual ~RegisterBank() = default;
 
     /// 读线圈（功能码 01，可读写位）。
     ///
+    /// @param[in] unit    请求里的 unit / 从站地址（0 = RTU 广播）
     /// @param[in] address 起始地址（0 基）
     /// @param[in] count   个数
     /// @param[out] out    结果，size 会被设为 count
     /// @return false 表示地址越界 → 回异常码 02
-    virtual bool read_coils(std::uint16_t address, std::uint16_t count,
-                            std::vector<bool>& out) = 0;
+    virtual bool read_coils(std::uint8_t unit, std::uint16_t address,
+                            std::uint16_t count, std::vector<bool>& out) = 0;
 
     /// 读离散输入（功能码 02，只读位）。
-    virtual bool read_discrete_inputs(std::uint16_t address, std::uint16_t count,
+    virtual bool read_discrete_inputs(std::uint8_t unit, std::uint16_t address,
+                                      std::uint16_t count,
                                       std::vector<bool>& out) = 0;
 
     /// 读保持寄存器（功能码 03，可读写）。
-    virtual bool read_holding_registers(std::uint16_t address, std::uint16_t count,
+    virtual bool read_holding_registers(std::uint8_t unit, std::uint16_t address,
+                                        std::uint16_t count,
                                         std::vector<std::uint16_t>& out) = 0;
 
     /// 读输入寄存器（功能码 04，只读）。
-    virtual bool read_input_registers(std::uint16_t address, std::uint16_t count,
+    virtual bool read_input_registers(std::uint8_t unit, std::uint16_t address,
+                                      std::uint16_t count,
                                       std::vector<std::uint16_t>& out) = 0;
 
     /// 写单个线圈（功能码 05）。
-    virtual bool write_single_coil(std::uint16_t address, bool value) = 0;
+    virtual bool write_single_coil(std::uint8_t unit, std::uint16_t address,
+                                   bool value) = 0;
 
     /// 写单个寄存器（功能码 06）。
-    virtual bool write_single_register(std::uint16_t address, std::uint16_t value) = 0;
+    virtual bool write_single_register(std::uint8_t unit, std::uint16_t address,
+                                       std::uint16_t value) = 0;
 
     /// 写多个线圈（功能码 0F）。
-    virtual bool write_multiple_coils(std::uint16_t address,
+    virtual bool write_multiple_coils(std::uint8_t unit, std::uint16_t address,
                                       const std::vector<bool>& values) = 0;
 
     /// 写多个寄存器（功能码 10）。
-    virtual bool write_multiple_registers(std::uint16_t address,
+    virtual bool write_multiple_registers(std::uint8_t unit,
+                                          std::uint16_t address,
                                           const std::vector<std::uint16_t>& values) = 0;
 
     /// 上一次 `read_* / write_*` 返回 false 时，希望库回哪个异常码。
@@ -180,6 +203,39 @@ public:
         ///
         /// @note 9600bps 的 3.5 字符 ≈ 4ms。设 0 表示按波特率自动计算。
         std::uint32_t silence_ms = 0;
+
+        // ---- 串口参数（只有 create_rtu 生效；create_tcp 忽略）----
+
+        /// 数据位（5~8）。
+        std::uint8_t   data_bits = 8;
+
+        /// 校验位（默认 none = 8N1，与改造前行为一致）。
+        SerialParity   parity    = SerialParity::none;
+
+        /// 停止位。
+        SerialStopBits stop_bits = SerialStopBits::one;
+
+        // ---- TCP 从站的连接管理（RTU 忽略）----
+
+        /// 连接空闲多久后主动断开。0 = 不断开（默认，与改造前一致）。
+        ///
+        /// "空闲"= 这段时间内**没收到任何完整请求帧**（收到的字节会重置计时，
+        /// 包括半帧）。从站不主动发请求，所以只能按"有没有人来问"来判断。
+        ///
+        /// @note 典型用途：现场有大量 NAT/半开连接时，长期挂着的死连接会占住
+        ///       fd 和内存。设成 60s~300s 比较合适。
+        /// @note 实现走 netmech 的 `enable_recv_keepalive`（定时器在 io 线程）。
+        /// @warning 如果客户端是"长连接但很久才问一次"（比如 10 分钟一次的
+        ///          采集），不要把这里设得比采集周期还小。
+        std::chrono::milliseconds idle_timeout{0};
+
+        /// 同时允许的客户端上限。0 = 不限制（默认，与改造前一致）。
+        ///
+        /// 超限的新连接在 accept 阶段直接拒绝（计入 `stats().rejected_clients`），
+        /// 不读一帧、不回应 —— 与 `authorize` 拒绝的路径相同。
+        ///
+        /// @note 计数是"当前会话数"，不是"历史连接数"；客户端断开后名额立刻释放。
+        std::size_t max_clients = 0;
     };
 
     /// RTU 从站（串口）。
@@ -211,7 +267,8 @@ public:
         std::uint64_t requests   = 0;
         std::uint64_t exceptions = 0;   ///< 回出去异常的次数
         std::uint64_t bad_frames = 0;   ///< CRC/长度错的帧（直接丢弃）
-        std::uint64_t rejected_clients = 0;   ///< 被 `authorize` 拒绝的连接数
+        std::uint64_t rejected_clients = 0;   ///< 被 `authorize` / `max_clients` 拒绝的连接数
+        std::uint64_t send_failures = 0;      ///< 响应没写出去（连接已断 / 写队列满）
     };
     [[nodiscard]] Stats stats() const noexcept;
 

@@ -54,6 +54,30 @@ enum class Exception : std::uint8_t {
 [[nodiscard]] const char* exception_name(Exception e) noexcept;
 
 // =============================================================================
+//  串口参数（RTU 用；TCP 无关）
+// =============================================================================
+
+/// 校验位。
+///
+/// 本库自己定义一套枚举而不是直接暴露 netmech 的类型：公共头不引 netmech 的
+/// 实现头，装配时在 src 里映射（见 rtu.cpp）。
+///
+/// @note Modbus over Serial Line V1.02 §2.3.2 给的**默认**是 8E1（偶校验），
+///       但现场也大量存在 8N1/8O1。以前本库写死 8N1 且不可配置，8E1 设备
+///       只能"永远超时"——所以这里必须可配。
+enum class SerialParity : std::uint8_t {
+    none = 0,   ///< 无校验（N）
+    odd,        ///< 奇校验（O）
+    even,       ///< 偶校验（E）
+};
+
+/// 停止位。
+enum class SerialStopBits : std::uint8_t {
+    one = 1,    ///< 1 位停止位（Modbus RTU 绝大多数设备）
+    two = 2,    ///< 2 位停止位
+};
+
+// =============================================================================
 //  协议限制
 // =============================================================================
 
@@ -127,6 +151,7 @@ enum class ModbusErrc {
     timeout,              ///< 超时
     not_connected,        ///< 未连接
     io_error,             ///< 传输层错误
+    busy,                 ///< 在途请求数已达上限（TCP 流水线配额），本次未受理
 };
 
 [[nodiscard]] const std::error_category& modbus_category() noexcept;

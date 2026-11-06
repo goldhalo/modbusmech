@@ -335,3 +335,33 @@ NETMECH_TEST(rtu_master_stats)
     CHECK(true);
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// 6. 串口参数校验：非法 data_bits / 越界枚举值 ⇒ invalid_argument
+//
+//    串口参数以前写死 8N1（8E1/8O1 设备根本连不上），现在由 Config 透传；
+//    但必须在**打开串口之前**就拦住非法值，而不是让它落到 termios 上。
+//    这条不依赖 pty，Windows 上同样能跑。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(master_rejects_bad_serial_params)
+{
+    Master::Config cfg;
+    std::error_code ec;
+
+    cfg.data_bits = 9;                              // 只支持 5~8
+    auto m = Master::create_rtu("/dev/null", cfg, 9600, ec);
+    CHECK(m == nullptr);
+    CHECK_EQ(ec, make_error_code(ModbusErrc::invalid_argument));
+
+    cfg.data_bits = 8;
+    cfg.parity    = static_cast<SerialParity>(7);   // 越界枚举值
+    m = Master::create_rtu("/dev/null", cfg, 9600, ec);
+    CHECK(m == nullptr);
+    CHECK_EQ(ec, make_error_code(ModbusErrc::invalid_argument));
+
+    cfg.parity    = SerialParity::none;
+    cfg.stop_bits = static_cast<SerialStopBits>(5); // 越界枚举值
+    m = Master::create_rtu("/dev/null", cfg, 9600, ec);
+    CHECK(m == nullptr);
+    CHECK_EQ(ec, make_error_code(ModbusErrc::invalid_argument));
+}

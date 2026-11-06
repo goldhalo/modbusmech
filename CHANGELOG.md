@@ -4,6 +4,38 @@
 
 ### 新增
 
+**示例程序 + 互测手册**
+
+- `example/master_main.cpp` → `modbusmech_master`：`rh/ri/rc/rd/wr/wrs/wc/wcs/poll`
+  子命令；`--async`（回调 + 内置超时）、`--inflight N`（TCP 流水线）、`--unit`、
+  `--parity E`（8E1）、`--auto-reconnect`、`--connect-timeout` 等选项
+- `example/slave_main.cpp` → `modbusmech_slave`：`tcp/rtu` 两种传输；
+  `--units`（一个实例模拟多台从站）、`--idle`/`--max-clients`（连接管理）、
+  `--boundary silence|length`（RTU 帧边界）、`--regs`；内置确定性初值的 DemoBank
+- `docs/interop.md`：与 libmodbus / mthings 的互测步骤、寄存器初值表、
+  10 条判定标准与常见坑
+- CMake 增加 `MODBUSMECH_BUILD_EXAMPLES`（默认 ON）
+
+**异步主站 `AsyncMaster`**
+
+- `include/modbusmech/async_master.hpp`：8 个功能码的回调式 API；
+  **每个请求自带 `Config::timeout`，超时由库触发回调**（回调恰好一次、
+  全在同一条派发线程上串行执行），调用方不需要自己兜超时
+
+**TCP 多事务流水线**
+
+- `Master::Config::max_in_flight`（默认 1）：>1 时同一 TCP 连接上允许多个
+  请求在途（MBAP 事务号匹配），同一个 `Master` 可被多个线程并发使用；
+  超过上限返回新增的 `ModbusErrc::busy`
+- 传输层接口改为 `send(pdu, unit, tid&)` / `receive(out, timeout, unit, tid)`，
+  解析统一在 io 线程完成
+
+**从站连接管理**
+
+- `Slave::Config::idle_timeout`：TCP 空闲连接自动断开
+- `Slave::Config::max_clients`：连接数上限（超出在 accept 阶段拒绝）
+- `Slave::Stats::send_failures`：响应写不出去（队满/已断）的计数，且会主动断开连接
+
 **CMake 安装与导出（find_package）**
 
 - `cmake --install` 现在装出完整的一套：头文件、静态库、`lib/cmake/modbusmech/` 下的
@@ -18,6 +50,25 @@
   这一串不用再手写
 
 - 默认安装前缀：Linux `/usr/local`，Windows `C:/Program Files/modbusmech`
+
+### 变更（**破坏性**）
+
+- **`RegisterBank` 的 8 个回调新增第一个参数 `unit`**（RTU 从站地址 / TCP Unit ID）：
+  多从站模拟与协议透传场景靠它区分设备。所有实现方需要改签名并重新编译
+- `Master::Config::auto_reconnect` 默认值改为 **false**（连接断了就报错）；
+  打开后是"请求时无连接就建连、建连失败/超时直接返回失败"的按需语义
+- `Master::Config::connect_timeout` 新增（默认 3s）
+
+### 修复
+
+- `RegisterBank` 抛异常导致 RTU 从站进程 `std::terminate` / TCP 会话僵死 →
+  统一收敛成异常码 04
+- 未知功能码被静默丢弃 → 按规范回 `01`（illegal function）
+- `bank_for` 抛异常会打死从站 → 按"该 unit 不存在"处理
+- RTU 主站发送帧 / RTU 从站响应帧的 use-after-free（改用 owner 托管缓冲）
+- 从站会话引用环导致 `client_count()` 永不归零
+- TCP 从站不校验 `Config::addresses`（配了 `--units` 也不生效）
+- 对端关闭时已收到的完整响应被丢弃（短连接设备随机超时）
 
 ---
 

@@ -258,7 +258,13 @@ std::error_code decode_pdu(span<const std::uint8_t> pdu, DecodedPdu& out) noexce
         out.address = get_u16(pdu, 1);
         out.count   = get_u16(pdu, 3);
         const std::uint8_t bc = pdu[5];
-        if (bc == 0 || pdu.size() < 6u + bc) {
+        // ★ byte count 必须与 count **精确匹配**。
+        //   以前只校验"缓冲够长"：bc < (count+7)/8 时，缺的那些位会被
+        //   unpack_bits 静默解成 0，从站于是把这段地址的线圈真的写成 0
+        //   （协议规定畸形请求要回 03/04，绝不能执行写）。
+        if (bc == 0 || pdu.size() < 6u + bc
+            || static_cast<std::size_t>(bc)
+                   != (static_cast<std::size_t>(out.count) + 7) / 8) {
             return make_error_code(ModbusErrc::bad_length);
         }
         unpack_bits(pdu.subspan(6, bc), out.count, out.bits);
@@ -272,7 +278,9 @@ std::error_code decode_pdu(span<const std::uint8_t> pdu, DecodedPdu& out) noexce
         out.address = get_u16(pdu, 1);
         out.count   = get_u16(pdu, 3);
         const std::uint8_t bc = pdu[5];
-        if (bc == 0 || (bc % 2) != 0 || pdu.size() < 6u + bc) {
+        // 同上：bc 必须等于 count × 2，少一个都说明帧不完整，不能猜着写。
+        if (bc == 0 || (bc % 2) != 0 || pdu.size() < 6u + bc
+            || static_cast<std::size_t>(bc) != static_cast<std::size_t>(out.count) * 2u) {
             return make_error_code(ModbusErrc::bad_length);
         }
         out.registers.reserve(bc / 2);

@@ -52,8 +52,11 @@ if (r.ok()) {
 class MyBank : public modbusmech::RegisterBank {
     std::vector<std::uint16_t> m_regs = std::vector<std::uint16_t>(1000, 0);
 
-    bool read_holding_registers(std::uint16_t addr, std::uint16_t cnt,
+    // ⚠ 每个回调的第一个参数是 unit（RTU 的从站地址 / TCP 的 Unit ID）。
+    //   正常单设备从站忽略它即可；做多设备或协议透传、需要知道"这是谁在问"时用它。
+    bool read_holding_registers(std::uint8_t unit, std::uint16_t addr, std::uint16_t cnt,
                                 std::vector<std::uint16_t>& out) override {
+        (void)unit;
         if (addr + cnt > m_regs.size()) return false;   // → 自动回异常码 02
         out.assign(m_regs.begin() + addr, m_regs.begin() + addr + cnt);
         return true;
@@ -129,6 +132,84 @@ struct Result {
 
 ---
 
+## 现场常见配置
+
+### 短连接设备（PLC 回完一个响应就断开）
+
+```cpp
+modbusmech::Master::Config cfg;
+cfg.auto_reconnect = true;      // 默认 **false**：连接断了就报错
+cfg.connect_timeout = std::chrono::milliseconds{3000};
+```
+
+默认（`false`）语义是"连接断了就报错"，让调用方立刻知道链路出问题。
+打开 `auto_reconnect` 后：**请求发出前发现没有连接就先建连**，建连失败/超时
+**直接返回失败**（不会在传输层里循环重试）。注意：短连接设备开着它也没用——
+对端不发包照样会断，它只是把"每次请求都自己重连"这件事挪进库里。
+
+### TCP 流水线（同一连接多事务在途）
+
+```cpp
+modbusmech::Master::Config cfg;
+cfg.max_in_flight = 4;   // 默认 1（与 RTU 一样串行）
+```
+
+协议允许同一连接上多个请求同时在途（靠 MBAP 事务号匹配）。`max_in_flight > 1`
+时**同一个 `Master` 可以被多个线程并发使用**，吞吐不再受"一问一答"限制；
+超过上限的并发请求返回 `ModbusErrc::busy`。
+
+⚠ 不是所有从站都支持流水线（很多 PLC/网关一次只处理一个请求），先拿真机验证。
+
+### 异步主站（回调 + 内置超时）
+
+不想让采集线程被阻塞、又不想自己写超时处理时用它：
+
+```cpp
+#include <modbusmech/async_master.hpp>
+
+modbusmech::AsyncMaster::Config ac;
+ac.timeout     = std::chrono::milliseconds{500};   // 超时后回调会带 timeout 触发
+ac.max_workers = 4;                                // 并发在途请求数
+
+std::error_code ec;
+auto am = modbusmech::AsyncMaster::create_tcp("192.168.1.10", 502, ac, ec);
+
+am->read_holding_registers(1, 0x0000, 10,
+    [](modbusmech::Result r, std::vector<std::uint16_t> regs) {
+        if (r.ok()) { /* 用 regs */ }
+        else        { /* r.ec 里是 timeout / not_connected / ... */ }
+    });
+```
+
+- **回调恰好触发一次**，超时由库负责，调用方不需要自己兜；
+- 所有回调在**同一条派发线程**上串行执行（回调里不要阻塞）；
+- 内部是 N 条工作线程驱动阻塞版 `Master`，同一连接上做流水线。
+
+### 串口校验位（8E1 / 8O1）
+
+Modbus 规范默认是 **8E1**，但很多设备是 8N1/8O1。默认值保持 8N1（与以前一致），
+需要时显式配：
+
+```cpp
+modbusmech::Master::Config cfg;
+cfg.data_bits = 8;
+cfg.parity    = modbusmech::SerialParity::even;     // 8E1
+cfg.stop_bits = modbusmech::SerialStopBits::one;
+```
+
+### TCP 从站的连接管理
+
+```cpp
+modbusmech::Slave::Config sc;
+sc.idle_timeout = std::chrono::seconds(120);   // 空闲连接自动断开（0 = 不断）
+sc.max_clients  = 8;                           // 连接数上限（0 = 不限）
+```
+
+被拒的连接计入 `slave->stats().rejected_clients`；响应写不出去（队列满/已断）计入
+`send_failures` 并主动断开该连接。
+
+---
+
 ## 为什么不用 libmodbus
 
 | 项 | libmodbus | modbusmech |
@@ -169,27 +250,48 @@ ctest --test-dir build --output-on-failure
 
 依赖：C++17、CMake ≥ 3.16、[netmech](../netmech)。
 
+### 示例程序
+
+默认随构建产出两个可执行文件（`-DMODBUSMECH_BUILD_EXAMPLES=OFF` 可关）：
+
+```bash
+./build/bin/modbusmech_slave  tcp 1502                    # 从站：模拟一台设备
+./build/bin/modbusmech_master tcp 127.0.0.1 1502 rh 0 10  # 主站：读 10 个保持寄存器
+```
+
+- `modbusmech_master`：`rh/ri/rc/rd/wr/wrs/wc/wcs/poll` 子命令；`--async`（回调 + 内置超时）、
+  `--inflight N`（TCP 流水线）、`--unit`、`--parity E`（8E1）、`--auto-reconnect` 等选项。
+- `modbusmech_slave`：`tcp/rtu` 两种传输；`--units`（一个实例模拟多台）、`--idle`/`--max-clients`
+  （连接管理）、`--boundary silence|length`（RTU 帧边界）、`--regs`（区大小）。
+
+两个示例互相当对端就能跑通全部功能；**和 libmodbus / mthings 的互测步骤见
+[docs/interop.md](docs/interop.md)**（含寄存器初值表、判定标准与常见坑）。
+
 ---
 
 ## 目录结构
 
 ```
 include/modbusmech/   公共头
-  common.hpp          功能码 / 异常码 / Result / 错误码
+  common.hpp          功能码 / 异常码 / Result / 错误码 / 串口参数
   span.hpp            轻量 span
   pdu.hpp             PDU 编解码（纯函数，无 IO）
-  master.hpp          主站
+  master.hpp          主站（阻塞）
+  async_master.hpp    主站（异步回调 + 内置超时）
   slave.hpp           从站 + RegisterBank
 
 src/
   pdu.cpp             编解码 + CRC16（纯函数）
   rtu.cpp             RTU 传输（串口 + 帧边界 + CRC）
-  tcp.cpp             TCP 传输（MBAP + 事务 ID）
+  tcp.cpp             TCP 传输（MBAP + 事务号 + 流水线 + 按需重连）
   slave.cpp           从站（RTU 单会话 / TCP 多客户端）
   master.cpp          主站逻辑（组帧 / 超时 / 重试）
+  async_master.cpp    异步主站（工作线程 + 派发线程）
 
+example/              示例程序（master / slave）
 test/                 单元测试
-docs/design/          概要设计
+docs/design/          概要设计 / TCP 非阻塞评估
+docs/interop.md       互测手册（libmodbus / mthings）
 ```
 
 ---

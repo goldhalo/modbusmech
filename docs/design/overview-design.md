@@ -263,14 +263,16 @@ libmodbus 用 `modbus_mapping_t`（四个静态数组）。问题：
 
 ```cpp
 class MyBank : public RegisterBank {
-    bool read_holding_registers(uint16_t addr, uint16_t count,
-                                std::vector<uint16_t>& out) override {
+    bool read_holding_registers(std::uint8_t unit, std::uint16_t addr,
+                                std::uint16_t count,
+                                std::vector<std::uint16_t>& out) override {
         if (addr + count > m_regs.size()) return false;   // → 异常码 02
         out.assign(m_regs.begin() + addr, m_regs.begin() + addr + count);
         return true;
     }
 
-    bool write_single_register(uint16_t addr, uint16_t value) override {
+    bool write_single_register(std::uint8_t unit, std::uint16_t addr,
+                               std::uint16_t value) override {
         if (addr >= m_regs.size()) return false;
         m_regs[addr] = value;
         on_register_changed(addr, value);   // ← 应用可以触发副作用
@@ -279,6 +281,10 @@ class MyBank : public RegisterBank {
     // ...
 };
 ```
+
+**每个回调的第一个参数是 `unit`**（RTU 的从站地址 / TCP 的 Unit ID）。
+正常单设备从站忽略它即可；做多设备模拟或协议透传时必须靠它区分"这一帧是谁
+在问"——库只把 unit 用于"是否应答"和"选哪个 bank"，不会替应用记忆设备状态。
 
 ### 8.2 返回值的约定
 

@@ -106,3 +106,33 @@ NETMECH_TEST(wire_u16_is_big_endian)
     CHECK_EQ(get_u16(v.data()), 0x1234);
     CHECK_EQ(get_u16(span<const std::uint8_t>(v.data(), v.size()), 0), 0x1234);
 }
+
+// ---------------------------------------------------------------------------
+// 7. rtu_request_frame_len：从站 length 帧边界的请求长度推算
+//
+//    从站用它在"不靠静默"的情况下切帧：读/写单个类固定 8 字节，0F/10 是
+//    9 + byte_count。算不出来（字节不够 / 未知功能码）返回 0，调用方回退到
+//    silence 兜底 —— 这是 length 模式不会卡死的关键。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(rtu_request_frame_len_fixed_and_multi)
+{
+    // 读保持寄存器：地址 + 功能码 + 4 + CRC = 8
+    const std::uint8_t rd[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x02};
+    CHECK_EQ(rtu_request_frame_len(rd, 1), std::size_t{0});   // 还不够 2 字节
+    CHECK_EQ(rtu_request_frame_len(rd, 2), std::size_t{8});
+    CHECK_EQ(rtu_request_frame_len(rd, 6), std::size_t{8});
+
+    // 写多寄存器：9 + bc(4) = 13
+    const std::uint8_t wr[] = {0x01, 0x10, 0x00, 0x00, 0x00, 0x02, 0x04,
+                               0x00, 0x11, 0x00, 0x22, 0x00, 0x00};
+    CHECK_EQ(rtu_request_frame_len(wr, 6), std::size_t{0});   // 还没到 byte count
+    CHECK_EQ(rtu_request_frame_len(wr, 7), std::size_t{13});
+
+    // 未知功能码 ⇒ 0（交给 silence 兜底）
+    const std::uint8_t unk[] = {0x01, 0x2B, 0x0E, 0x01, 0x00};
+    CHECK_EQ(rtu_request_frame_len(unk, 5), std::size_t{0});
+
+    // 异常响应样式（功能码最高位置 1）从站不该收到 ⇒ 0
+    const std::uint8_t exc[] = {0x01, 0x83, 0x02};
+    CHECK_EQ(rtu_request_frame_len(exc, 3), std::size_t{0});
+}

@@ -21,6 +21,7 @@
 #include <netmech/serial.hpp>
 
 #include "tcp.hpp"
+#include "rtu.hpp"
 
 #include <array>
 #include <atomic>
@@ -61,6 +62,7 @@ public:
         std::atomic<std::uint64_t> exceptions{0};
         std::atomic<std::uint64_t> bad_frames{0};
         std::atomic<std::uint64_t> rejected_clients{0};
+        std::atomic<std::uint64_t> send_failures{0};
     };
     StatsAtomic                   stats;
 
@@ -115,7 +117,16 @@ public:
     {
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            m_rx.insert(m_rx.end(), data, data + n);
+            // ★ 缓冲上限：Modbus RTU 的 ADU 最大 256 字节，512 已经够放下
+            //   "两帧粘一起"。超过说明线路在持续出字节却没有静默（波特率配错、
+            //   干扰、另一台主站狂发）——那样静默切帧永远不成立，缓冲会无限涨，
+            //   长期运行迟早 OOM。这里强制丢弃并计入 bad_frames。
+            if (m_rx.size() + n > Limits::max_rtu_adu * 2) {
+                m_rx.clear();
+                stats.bad_frames.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                m_rx.insert(m_rx.end(), data, data + n);
+            }
             m_last_rx = std::chrono::steady_clock::now();
         }
         m_cv.notify_all();
@@ -148,10 +159,11 @@ public:
         return std::chrono::microseconds(static_cast<std::int64_t>(us + 0.5));
     }
 
-    /// 帧处理线程：等 silence，然后处理整帧。
+    /// 帧处理线程：等 silence（或 length 模式下收够期望长度），然后处理整帧。
     void run()
     {
-        const auto silence = frame_gap();
+        const auto silence   = frame_gap();
+        const bool by_length = (cfg.boundary == Config::FrameBoundary::length);
 
         while (!m_stop.load()) {
             std::vector<std::uint8_t> frame;
@@ -163,6 +175,25 @@ public:
                         m_cv.wait_for(lk, 50ms);   // 没数据，小睡等
                         continue;
                     }
+
+                    // ① length 模式：能算出期望长度、且已收齐 ⇒ 立刻切帧，
+                    //    不用等静默（比纯长度少一次静默延迟，也避免了"粘帧"）。
+                    if (by_length) {
+                        const std::size_t want =
+                            detail::rtu_request_frame_len(m_rx.data(), m_rx.size());
+                        if (want > 0 && m_rx.size() >= want) {
+                            frame.assign(m_rx.begin(),
+                                         m_rx.begin() + static_cast<std::ptrdiff_t>(want));
+                            m_rx.erase(m_rx.begin(),
+                                       m_rx.begin() + static_cast<std::ptrdiff_t>(want));
+                            break;
+                        }
+                        // 算不出来（字节还不够 / 功能码不认识）或还没收够 ⇒
+                        // 落到下面的 silence 兜底。这正是 length 模式相对"纯长度"
+                        // 的改进：不会因为不认识的功能码或畸形帧把这一路卡死。
+                    }
+
+                    // ② silence 兜底：线路安静够久 ⇒ 把现有字节当成一帧
                     const auto elapsed = std::chrono::steady_clock::now() - m_last_rx;
                     if (elapsed >= silence) {
                         frame = std::move(m_rx);
@@ -185,10 +216,20 @@ public:
     ///
     /// 未配置 `bank_for` ⇒ 全部 unit 共用 `create_rtu/create_tcp` 传入的那个 bank。
     /// 配置了但回调返回空 ⇒ 该 unit 视为"不存在"，调用处静默丢弃。
-    [[nodiscard]] std::shared_ptr<RegisterBank> pick_bank(std::uint8_t unit) const
+    ///
+    /// ★ `bank_for` 是应用回调，抛异常不能穿出去：
+    ///   RTU 侧会打断帧线程（run() 外层兜底后从站直接停摆），TCP 侧会关掉连接。
+    ///   这里按"该 unit 没有 bank"处理（返回空 ⇒ 静默丢弃），与它返回空指针的
+    ///   语义一致；同时计入 bad_frames，便于从日志看出是回调在抛。
+    [[nodiscard]] std::shared_ptr<RegisterBank> pick_bank(std::uint8_t unit)
     {
         if (cfg.bank_for) {
-            return cfg.bank_for(unit);
+            try {
+                return cfg.bank_for(unit);
+            } catch (...) {
+                stats.bad_frames.fetch_add(1, std::memory_order_relaxed);
+                return nullptr;
+            }
         }
         return bank;
     }
@@ -235,7 +276,7 @@ public:
         // ---- 解析 PDU ----
         const span<const std::uint8_t> pdu(frame.data() + 1, data_len - 1);
         std::vector<std::uint8_t> resp;
-        if (!handle_pdu(*b, pdu, resp)) {
+        if (!handle_pdu(unit, *b, pdu, resp)) {
             return;   // 无法处理（畸形帧），丢弃
         }
 
@@ -251,15 +292,26 @@ public:
         // 🔴 响应地址必须回显**请求的 unit**，不能写 cfg.address ——
         //    多从站模式下 cfg.address 只是个"默认值"，回错地址会让主站把
         //    响应当噪声丢弃（主站按自己发出的 unit 校验应答）。
-        auto out = detail::wrap_rtu(unit, span<const std::uint8_t>(resp.data(), resp.size()));
+        //
+        // ★ 用 owner 托管响应帧：netmech 的串口写是异步的（只排指针、不拷数据），
+        //   局部 vector 一出作用域就悬垂。从站连发响应 / 低波特率时上一笔写可能
+        //   还没回调，本帧会被排队 → 稍后从已释放内存取数据（UAF）。
+        auto out = std::make_shared<std::vector<std::uint8_t>>(
+            detail::wrap_rtu(unit, span<const std::uint8_t>(resp.data(), resp.size())));
         if (port) {
-            port->write(netmech::ConstBuf{nullptr, out.data(), out.size()});
+            // 写不进去（队满 / 端口已关）要把响应丢掉并计数 —— 以前完全忽略返回值，
+            // 表现是"主站超时、从站什么都不知道"。
+            if (!port->write(netmech::ConstBuf{out, out->data(), out->size()})) {
+                stats.send_failures.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 
     /// 处理一个请求 PDU，产出响应 PDU。
-    /// @return false 表示无法处理（畸形/未知功能码且不想回异常）
-    bool handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu, std::vector<std::uint8_t>& resp);
+    /// @param[in] unit 请求里的 unit（要透传给 RegisterBank：透传/网关场景靠它区分设备）
+    /// @return false 表示无法处理（畸形帧，静默丢弃）
+    bool handle_pdu(std::uint8_t unit, RegisterBank& b, span<const std::uint8_t> pdu,
+                    std::vector<std::uint8_t>& resp);
 
     /// TCP 的一个客户端会话。
     ///
@@ -279,6 +331,7 @@ public:
 
         ~TcpSession() override
         {
+            
             if (m_owner) {
                 m_owner->clients.fetch_sub(1);
             }
@@ -287,13 +340,22 @@ public:
         bool on_open(std::shared_ptr<netmech::Conn> conn) override
         {
             (void)conn;
+            
+            // 空闲超时：借 netmech 的接收侧保活定时器实现 —— 连续
+            // idle_timeout 没收到任何字节就回调 on_idle，max_miss=1 时
+            // 回调返回后 netmech 以 keepalive_timeout 结束连接。
+            // 从站不主动发请求，所以"没收到字节"就是"没人来问"。
+            if (m_owner->cfg.idle_timeout.count() > 0) {
+                m_conn->enable_recv_keepalive(m_owner->cfg.idle_timeout,
+                                              m_owner->cfg.idle_timeout, 1);
+            }
             return start_read();
         }
 
         void on_read(std::error_code ec, netmech::Buf buf, std::size_t n) override
         {
             if (ec) {
-                m_conn->close();
+                close_conn();
                 return;
             }
             if (n > 0) {
@@ -303,10 +365,19 @@ public:
                 //   超过说明对端在发自造帧（或我们切帧逻辑坏），直接断 ——
                 //   半帧永远到不齐时 m_rx 会无限涨，恶意客户端能靠这个占内存。
                 if (m_rx.size() > kMaxTcpAduLen * 2) {
-                    m_conn->close();
+                    close_conn();
                     return;
                 }
-                process();
+                try {
+                    process();
+                } catch (...) {
+                    // 处理过程中抛异常（bank 已在 handle_pdu 收敛，这里兜的是其它
+                    // 逃逸异常，例如分配失败）：连接内部状态已不可信，直接关掉。
+                    // 关键点是**不能**跳过下面的 start_read() —— 否则这条会话会
+                    // 变成"没有在途读"的僵尸：不响应、不断开，只有对端超时。
+                    close_conn();
+                    return;
+                }
             }
             start_read();
         }
@@ -314,16 +385,39 @@ public:
         void on_write(std::error_code ec, netmech::ConstBuf, std::size_t) override
         {
             if (ec) {
+                close_conn();
+            }
+        }
+
+        /// 关闭连接（幂等、空安全）。on_close 之后 m_conn 已经释放，这里要能容忍。
+        void close_conn() noexcept
+        {
+            if (m_conn) {
                 m_conn->close();
             }
         }
 
-        void on_close() override {}
+        /// 连接终结。
+        ///
+        /// ★ 这里必须把 m_conn 放掉：netmech 的 finish_handler 会把 handler
+        ///   （也就是本会话）留成 retired_handler 快照，直到 Conn::Impl 析构；
+        ///   而本会话又持着 shared_ptr<Conn> —— 两者互持成环，会话永远不析构，
+        ///   `client_count()` 只增不减（实测：空闲超时断开后仍为 1）。
+        ///   放掉 m_conn 后，Conn::Impl 随关闭流程结束而析构 → 快照释放 →
+        ///   本会话析构 → clients 正确递减。
+        void on_close() override
+        {
+            m_conn.reset();
+        }
 
     private:
         bool start_read()
         {
-            return m_conn->read(netmech::Buf{nullptr, m_chunk.data(), m_chunk.size()});
+            // on_close 之后 m_conn 已释放：不要再发起读（否则空指针解引用 ——
+            // netmech 在关闭时会先投递 on_read(aborted) 再调 on_close 的顺序
+            // 不保证，两种顺序都可能出现）。
+            return m_conn
+                && m_conn->read(netmech::Buf{nullptr, m_chunk.data(), m_chunk.size()});
         }
 
         void process()
@@ -340,7 +434,7 @@ public:
 
                 if (proto != 0 || len < 2) {
                     // 帧已经不可信，关掉连接（让它重连重来）
-                    m_conn->close();
+                    close_conn();
                     return;
                 }
                 const std::size_t total = 6 + len;
@@ -348,11 +442,22 @@ public:
                 //   不查的话，一个 len=0xFFFF 的伪帧就能让我们等 64KB，
                 //   并把这期间的流量全堆在 m_rx 里。
                 if (total > kMaxTcpAduLen) {
-                    m_conn->close();
+                    close_conn();
                     return;
                 }
                 if (m_rx.size() < total) {
                     return;   // 还没收够
+                }
+
+                // ★ 显式配置了 `Config::addresses` 时按它过滤单元：
+                //   不在名单里的 unit 静默丢弃（与 RTU 的地址过滤一致）。
+                //   默认（addresses 为空）TCP 仍保持"谁都能问"的宽松语义 ——
+                //   Modbus TCP 的 unit 常被忽略/当路由字段，很多客户端用 0/255。
+                //   以前这里完全不看 addresses，配了 --units 也不生效。
+                if (!m_owner->cfg.addresses.empty() && !m_owner->cfg.accepts(unit)) {
+                    m_rx.erase(m_rx.begin(),
+                               m_rx.begin() + static_cast<std::ptrdiff_t>(total));
+                    continue;
                 }
 
                 // 取出 PDU（跳过 7 字节 MBAP）
@@ -365,7 +470,7 @@ public:
                 auto b = m_owner->pick_bank(unit);
 
                 std::vector<std::uint8_t> resp;
-                const bool ok = b ? m_owner->handle_pdu(*b, pdu, resp) : false;
+                const bool ok = b ? m_owner->handle_pdu(unit, *b, pdu, resp) : false;
 
                 // 吃掉这一帧
                 m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<std::ptrdiff_t>(total));
@@ -390,7 +495,12 @@ public:
                 if (resp.size() == 2 && (resp[0] & 0x80u)) {
                     m_owner->stats.exceptions.fetch_add(1, std::memory_order_relaxed);
                 }
-                m_owner->write_conn(m_conn, std::move(out));
+                // 写不进去（队满 / 连接已断）⇒ 关掉这条连接：客户端立刻能重连
+                // 重来，比"响应静默丢失、只能等超时"强。
+                if (!m_owner->write_conn(m_conn, std::move(out))) {
+                    close_conn();
+                    return;
+                }
             }
         }
 
@@ -401,11 +511,21 @@ public:
     };
 
     /// 往一个 Conn 写（TCP 会话用）。
-    void write_conn(const std::shared_ptr<netmech::Conn>& conn,
+    /// @return false 表示没写进去（发送队列满 / 连接已关闭）
+    bool write_conn(const std::shared_ptr<netmech::Conn>& conn,
                     std::vector<std::uint8_t>&& data)
     {
+        if (!conn) {
+            return false;   // on_close 之后会话已放掉连接
+        }
         auto holder = std::make_shared<std::vector<std::uint8_t>>(std::move(data));
-        conn->write(netmech::ConstBuf{holder, holder->data(), holder->size()});
+        if (!conn->write(netmech::ConstBuf{holder, holder->data(), holder->size()})) {
+            // 以前完全忽略返回值：写队列满（netmech 默认 2MB/256 笔）时响应
+            // 静默丢失，客户端只会超时，从站侧也看不到任何异常计数。
+            stats.send_failures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
     }
 
     /// TCP 的 Linkable：每个 accept 建一个会话。
@@ -417,6 +537,15 @@ public:
         {
             auto owner = m_owner.lock();
             if (!owner) {
+                return nullptr;
+            }
+
+            // ---- 连接数上限：超了直接拒 ----
+            // 与 authorize 拒绝走同一条路径（不读一帧、不回应）。accept 由监听器
+            // 串行驱动，所以这里"读计数 → 建会话"之间不会有并发 accept 插进来。
+            if (owner->cfg.max_clients != 0
+                && owner->clients.load(std::memory_order_relaxed) >= owner->cfg.max_clients) {
+                owner->stats.rejected_clients.fetch_add(1, std::memory_order_relaxed);
                 return nullptr;
             }
 
@@ -466,10 +595,24 @@ public:
 //  请求处理
 // =============================================================================
 
-bool Slave::Impl::handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu,
+bool Slave::Impl::handle_pdu(std::uint8_t unit, RegisterBank& b,
+                             span<const std::uint8_t> pdu,
                              std::vector<std::uint8_t>& resp)
 {
     resp.clear();
+
+    // ★ 未知功能码必须回 01（illegal_function），不能静默丢弃。
+    //   以前这里直接交给 decode_pdu：它对不认识的功能码返回 invalid_argument，
+    //   handle_pdu 就把它当"畸形帧"丢了 —— 主站只能等到超时，无法区分
+    //   "设备不支持这个功能码"和"设备根本没响应"。规范（V1.1b3 §7）要求前者
+    //   回 01，后者才是静默。
+    //   注意：功能码最高位为 1 的是异常响应，从站不该收到，仍按畸形帧丢弃。
+    if (!pdu.empty() && (pdu[0] & 0x80u) == 0
+        && !is_known_function(static_cast<Function>(pdu[0]))) {
+        (void)encode_exception(static_cast<Function>(pdu[0]),
+                               Exception::illegal_function, resp);
+        return true;
+    }
 
     DecodedPdu d;
     if (decode_pdu(pdu, d) != std::error_code{}) {
@@ -496,15 +639,53 @@ bool Slave::Impl::handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu,
     ///   厂家规约回的是 `01 84 03`（illegal_data_value），不是 02；
     ///   而 EAS 靠"回 03"来判断队列空、靠"传输失败"判断链路故障 ——
     ///   两者混不起来，回错码会让 EAS 把空队列当成配置错误。
+    ///
+    /// ★ last_exception() 同样是应用实现的虚函数，也可能抛 —— 它一抛就说明
+    ///   bank 连"该回哪个码"都给不出来，按 04 处理，不能让它穿出去。
     auto bank_error = [&]() -> Exception {
-        const Exception e = b.last_exception();
-        return e == Exception::none ? Exception::illegal_data_address : e;
+        try {
+            const Exception e = b.last_exception();
+            return e == Exception::none ? Exception::illegal_data_address : e;
+        } catch (...) {
+            return Exception::server_device_failure;
+        }
+    };
+
+    /// bank 调用的三态结果：
+    ///   ok      = bank 返回 true（正常处理）
+    ///   refused = bank 返回 false（按 bank_error() 决定异常码）
+    ///   threw   = bank 抛了异常（resp 已经是 04，调用处直接返回）
+    enum class BankResult { ok, refused, threw };
+
+    /// 调用应用侧 bank 的统一入口（**异常收敛点**）。
+    ///
+    /// 设计文档 §8.2 的承诺是「bank 抛异常 → 库捕获 → 回 04（从站故障）并记
+    /// stats.exceptions」，这里负责前半段：**绝不把异常带出本函数**。
+    /// 不兜住的后果分两条链路：
+    ///   · RTU：handle_frame 跑在独立线程里，异常穿出 run() = std::terminate
+    ///     （整个进程直接死）；
+    ///   · TCP：netmech 的 invoke_void 会吞掉异常，但会跳过 on_read 末尾的
+    ///     start_read() —— 该会话从此没有在途读，静默僵死（不响应也不断开）。
+    /// 统计口径：resp 变成 2 字节异常帧后，由 handle_frame / TcpSession::process
+    /// 统一计数，这里不重复自增。
+    auto call_bank = [&](auto&& fn) -> BankResult {
+        try {
+            return fn() ? BankResult::ok : BankResult::refused;
+        } catch (...) {
+            exception(Exception::server_device_failure);   // resp = f|0x80, 04
+            return BankResult::threw;
+        }
     };
 
     switch (f) {
     case Function::read_coils: {
         if (d.count == 0 || d.count > Limits::max_read_bits) { exception(Exception::illegal_data_value); return true; }
-        if (!b.read_coils(d.address, d.count, bits))      { exception(bank_error()); return true; }
+        const BankResult br = call_bank([&] { return b.read_coils(unit, d.address, d.count, bits); });
+        if (br == BankResult::threw)   { return true; }               // resp 已是 04
+        if (br == BankResult::refused) { exception(bank_error()); return true; }
+        // bank 必须严格返回 count 个：多填/少填都不能凑合发帧 —— byte count 与
+        // 请求的 count 对不上，对端会判 bad_length；多填还会让字节数溢出 uint8_t。
+        if (bits.size() != d.count) { exception(Exception::server_device_failure); return true; }
         const std::size_t nbytes = (bits.size() + 7) / 8;
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(nbytes));
@@ -519,7 +700,10 @@ bool Slave::Impl::handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu,
 
     case Function::read_discrete_inputs: {
         if (d.count == 0 || d.count > Limits::max_read_bits) { exception(Exception::illegal_data_value); return true; }
-        if (!b.read_discrete_inputs(d.address, d.count, bits)) { exception(bank_error()); return true; }
+        const BankResult br = call_bank([&] { return b.read_discrete_inputs(unit, d.address, d.count, bits); });
+        if (br == BankResult::threw)   { return true; }
+        if (br == BankResult::refused) { exception(bank_error()); return true; }
+        if (bits.size() != d.count) { exception(Exception::server_device_failure); return true; }
         const std::size_t nbytes = (bits.size() + 7) / 8;
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(nbytes));
@@ -534,7 +718,10 @@ bool Slave::Impl::handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu,
 
     case Function::read_holding_registers: {
         if (d.count == 0 || d.count > Limits::max_read_registers) { exception(Exception::illegal_data_value); return true; }
-        if (!b.read_holding_registers(d.address, d.count, regs)) { exception(bank_error()); return true; }
+        const BankResult br = call_bank([&] { return b.read_holding_registers(unit, d.address, d.count, regs); });
+        if (br == BankResult::threw)   { return true; }
+        if (br == BankResult::refused) { exception(bank_error()); return true; }
+        if (regs.size() != d.count) { exception(Exception::server_device_failure); return true; }
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(regs.size() * 2));
         for (std::uint16_t v : regs) {
@@ -546,7 +733,10 @@ bool Slave::Impl::handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu,
 
     case Function::read_input_registers: {
         if (d.count == 0 || d.count > Limits::max_read_registers) { exception(Exception::illegal_data_value); return true; }
-        if (!b.read_input_registers(d.address, d.count, regs)) { exception(bank_error()); return true; }
+        const BankResult br = call_bank([&] { return b.read_input_registers(unit, d.address, d.count, regs); });
+        if (br == BankResult::threw)   { return true; }
+        if (br == BankResult::refused) { exception(bank_error()); return true; }
+        if (regs.size() != d.count) { exception(Exception::server_device_failure); return true; }
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(regs.size() * 2));
         for (std::uint16_t v : regs) {
@@ -559,21 +749,27 @@ bool Slave::Impl::handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu,
     case Function::write_single_coil: {
         // 05 的"值"是 FF00（开）或 0000（关），其他值非法
         if (d.value != 0xFF00 && d.value != 0x0000) { exception(Exception::illegal_data_value); return true; }
-        if (!b.write_single_coil(d.address, d.value == 0xFF00)) { exception(bank_error()); return true; }
+        const BankResult br = call_bank([&] { return b.write_single_coil(unit, d.address, d.value == 0xFF00); });
+        if (br == BankResult::threw)   { return true; }
+        if (br == BankResult::refused) { exception(bank_error()); return true; }
         // 回显原请求
         resp.assign(pdu.begin(), pdu.end());
         return true;
     }
 
     case Function::write_single_register: {
-        if (!b.write_single_register(d.address, d.value)) { exception(bank_error()); return true; }
+        const BankResult br = call_bank([&] { return b.write_single_register(unit, d.address, d.value); });
+        if (br == BankResult::threw)   { return true; }
+        if (br == BankResult::refused) { exception(bank_error()); return true; }
         resp.assign(pdu.begin(), pdu.end());
         return true;
     }
 
     case Function::write_multiple_coils: {
         if (d.bits.size() > Limits::max_write_bits || d.bits.empty()) { exception(Exception::illegal_data_value); return true; }
-        if (!b.write_multiple_coils(d.address, d.bits)) { exception(bank_error()); return true; }
+        const BankResult br = call_bank([&] { return b.write_multiple_coils(unit, d.address, d.bits); });
+        if (br == BankResult::threw)   { return true; }
+        if (br == BankResult::refused) { exception(bank_error()); return true; }
         // 回显"地址 + 数量"
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(d.address >> 8));
@@ -585,7 +781,9 @@ bool Slave::Impl::handle_pdu(RegisterBank& b, span<const std::uint8_t> pdu,
 
     case Function::write_multiple_registers: {
         if (d.registers.size() > Limits::max_write_registers || d.registers.empty()) { exception(Exception::illegal_data_value); return true; }
-        if (!b.write_multiple_registers(d.address, d.registers)) { exception(bank_error()); return true; }
+        const BankResult br = call_bank([&] { return b.write_multiple_registers(unit, d.address, d.registers); });
+        if (br == BankResult::threw)   { return true; }
+        if (br == BankResult::refused) { exception(bank_error()); return true; }
         resp.push_back(static_cast<std::uint8_t>(f));
         resp.push_back(static_cast<std::uint8_t>(d.address >> 8));
         resp.push_back(static_cast<std::uint8_t>(d.address & 0xFF));
@@ -635,6 +833,13 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
         return nullptr;
     }
 
+    // 串口参数校验（data_bits 5~8、枚举值合法）—— 与主站同一套判断，
+    // 见 rtu.cpp 的 serial_params_valid()。
+    if (!detail::serial_params_valid(cfg.parity, cfg.stop_bits, cfg.data_bits)) {
+        ec = make_error_code(ModbusErrc::invalid_argument);
+        return nullptr;
+    }
+
     auto impl = std::make_shared<Impl>();
     impl->cfg  = cfg;
     impl->bank = std::move(bank);
@@ -644,7 +849,8 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
     netmech::SerialConfig sc;
     sc.device    = device;
     sc.baud_rate = baud_rate;
-    sc.data_bits = 8;
+    // 以前这里写死 8N1（只设 data_bits=8），8E1/8O1 的设备根本连不上。
+    detail::apply_serial_params(cfg.parity, cfg.stop_bits, cfg.data_bits, sc);
 
     auto sink = std::make_shared<Impl::SerialSink>(impl);
     impl->port = netmech::SerialPort::create(sc, sink, ec);
@@ -653,7 +859,17 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
     }
     sink->start();
 
-    impl->m_thread = std::thread([impl] { impl->run(); });
+    impl->m_thread = std::thread([impl] {
+        // 最后一道防线：bank 的异常已在 handle_pdu 里收敛成 04 响应，这里再兜
+        // 一层是为了杜绝"任何逃逸异常 → 线程函数返回 → std::terminate 整进程"。
+        // 真走到这里说明有未预料的故障：置 stop 让 is_running() 变 false，
+        // 至少上层能观测到从站已停，而不是静默死掉。
+        try {
+            impl->run();
+        } catch (...) {
+            impl->m_stop.store(true);
+        }
+    });
 
     auto s = std::shared_ptr<Slave>(new Slave());
     s->m_impl = impl;
@@ -731,6 +947,7 @@ Slave::Stats Slave::stats() const noexcept
     out.exceptions       = m_impl->stats.exceptions.load(std::memory_order_relaxed);
     out.bad_frames       = m_impl->stats.bad_frames.load(std::memory_order_relaxed);
     out.rejected_clients = m_impl->stats.rejected_clients.load(std::memory_order_relaxed);
+    out.send_failures    = m_impl->stats.send_failures.load(std::memory_order_relaxed);
     return out;
 }
 

@@ -94,6 +94,7 @@ public:
         case ModbusErrc::timeout:            return "timeout";
         case ModbusErrc::not_connected:      return "not connected";
         case ModbusErrc::io_error:           return "I/O error";
+        case ModbusErrc::busy:               return "too many in-flight requests";
         }
         return "unknown modbusmech error";
     }

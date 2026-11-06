@@ -70,10 +70,13 @@ public:
         //   或者在允许流水线的链路上自己控制节奏），而且"库替你串行化"这件事
         //   一旦写进实现，调用方就很难察觉自己踩了并发。
 
-        if (!transport || !transport->is_open()) {
+        if (!transport) {
             ec = make_error_code(ModbusErrc::not_connected);
             return;
         }
+        // ★ 这里**不再**预检查 transport->is_open()：TCP 短连接设备回完一个
+        //   响应就断开，send() 内部会按需自动重连（ensure_connected）。在这里
+        //   提前 return 会把重连彻底挡住 —— 表现是"只能问到第一个响应"。
 
         for (int attempt = 0; attempt <= cfg.retries; ++attempt) {
             stats.requests.fetch_add(1, std::memory_order_relaxed);
@@ -86,7 +89,8 @@ public:
             //    ★ unit 由这里**按调用传入**，不再让 transport 自己存一份 ——
             //      以前 TCP 侧那个成员从未被赋值，恒为 1，cfg.unit != 1 时
             //      发出去 unit=1、校验却按 cfg.unit，必然失败。
-            ec = transport->send(pdu, unit);
+            std::uint16_t tid = 0;   // TCP = 事务号；RTU = 0
+            ec = transport->send(pdu, unit, tid);
             if (ec) {
                 stats.send_errors.fetch_add(1, std::memory_order_relaxed);   // 不是超时：别混进 timeouts
                 // 重试间隔：以前只有"等响应失败"才 sleep，发送失败会立刻重打，
@@ -99,13 +103,20 @@ public:
 
             // 3. 收响应
             std::vector<std::uint8_t> adu;
-            ec = transport->receive(adu, cfg.timeout, unit);
+            ec = transport->receive(adu, cfg.timeout, unit, tid);
             if (ec) {
                 if (ec == ModbusErrc::crc_mismatch) {
                     stats.crc_errors.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     stats.timeouts.fetch_add(1, std::memory_order_relaxed);
                 }
+                // ★ 失败后重同步（传输层语义，见 transport.hpp）：
+                //   RTU 没有事务号，本笔超时后从站的**迟到响应**可能在下一笔
+                //   期间到达，而它和本次请求的地址/功能码/长度全都一样 —— 会被
+                //   当成本次的响应，静默返回上一轮的寄存器值。resync() 会等到
+                //   线路连续安静（silence_ms）再清缓冲，把这些在途字节收掉。
+                //   TCP 有 TID 兜底，这一步等价于清缓冲，不引入延迟。
+                transport->resync();
                 if (attempt < cfg.retries) {
                     std::this_thread::sleep_for(cfg.retry_delay);
                 }
@@ -235,6 +246,10 @@ std::shared_ptr<Master> Master::create_rtu(const std::string& device,
 
     detail::RtuTransport::Config rc;
     rc.baud_rate = baud_rate;
+    // 串口参数由 Config 透传（以前写死 8N1，8E1/8O1 设备连不上）。
+    rc.data_bits = cfg.data_bits;
+    rc.parity    = cfg.parity;
+    rc.stop_bits = cfg.stop_bits;
 
     auto tr = detail::RtuTransport::create(device, rc, ec);
     if (!tr) {
@@ -264,6 +279,10 @@ std::shared_ptr<Master> Master::create_tcp(const std::string& host,
     if (!tr) {
         return nullptr;
     }
+    // 连接策略：是否按需重连、建连超时、同连接在途请求上限（流水线）。
+    tr->set_auto_reconnect(cfg.auto_reconnect);
+    tr->set_connect_timeout(cfg.connect_timeout);
+    tr->set_max_in_flight(cfg.max_in_flight);
 
     auto m = std::shared_ptr<Master>(new Master());
     m->m_impl = std::make_shared<Impl>();
@@ -302,6 +321,8 @@ Master::Stats Master::stats() const noexcept
     out.send_errors = m_impl->stats.send_errors.load(std::memory_order_relaxed);
     out.exceptions  = m_impl->stats.exceptions.load(std::memory_order_relaxed);
     out.crc_errors  = m_impl->stats.crc_errors.load(std::memory_order_relaxed);
+    // 重连次数在传输层（只有 TCP 会重连；RTU 恒 0）。
+    out.reconnects  = m_impl->transport ? m_impl->transport->reconnects() : 0;
     return out;
 }
 

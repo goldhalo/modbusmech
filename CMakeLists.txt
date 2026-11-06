@@ -98,6 +98,24 @@ if(MODBUSMECH_BUILD_TESTS)
 endif()
 
 # ---------------------------------------------------------------------------
+# 示例程序（主站 / 从站）
+# ---------------------------------------------------------------------------
+#  没有对接真实设备时，可以把两个示例互相当对端跑起来：
+#     ./bin/modbusmech_slave  tcp 1502
+#     ./bin/modbusmech_master tcp 127.0.0.1 1502 rh 0 10
+#  也可以和第三方实现（libmodbus / mthings）互测，见 docs/interop.md。
+option(MODBUSMECH_BUILD_EXAMPLES "构建示例程序（master / slave）" ON)
+if(MODBUSMECH_BUILD_EXAMPLES)
+    add_executable(modbusmech_master example/master_main.cpp)
+    target_link_libraries(modbusmech_master
+        PRIVATE modbusmech::modbusmech modbusmech_compile_options)
+
+    add_executable(modbusmech_slave example/slave_main.cpp)
+    target_link_libraries(modbusmech_slave
+        PRIVATE modbusmech::modbusmech modbusmech_compile_options)
+endif()
+
+# ---------------------------------------------------------------------------
 # 安装与导出
 # ---------------------------------------------------------------------------
 #  装完之后使用者只需要：

@@ -80,10 +80,71 @@ std::size_t rtu_response_body_len(const std::uint8_t* p, std::size_t avail) noex
 }
 
 
+std::size_t rtu_request_frame_len(const std::uint8_t* p, std::size_t avail) noexcept
+{
+    if (avail < 2) {
+        return 0;
+    }
+    const std::uint8_t func = p[1];
+    if (func & 0x80u) {
+        return 0;   // 从站不该收到异常响应；算不出就交给 silence 兜底
+    }
+
+    switch (static_cast<Function>(func)) {
+    case Function::read_coils:
+    case Function::read_discrete_inputs:
+    case Function::read_holding_registers:
+    case Function::read_input_registers:
+    case Function::write_single_coil:
+    case Function::write_single_register:
+        // 地址(1) + 功能码(1) + 4 + CRC(2)
+        return 8;
+
+    case Function::write_multiple_coils:
+    case Function::write_multiple_registers:
+        // 地址(1) + 功能码(1) + 地址(2) + 数量(2) + 字节数(1) + 数据(n) + CRC(2)
+        if (avail < 7) {
+            return 0;   // 还没收到 byte count，算不出来
+        }
+        return 9 + static_cast<std::size_t>(p[6]);
+
+    default:
+        return 0;       // 未知功能码：交给 silence 兜底
+    }
+}
+
+
+bool serial_params_valid(SerialParity parity, SerialStopBits stop_bits,
+                         std::uint8_t data_bits) noexcept
+{
+    // 枚举值必须在值域内：调用方 static_cast 出非法值时不能静默当成默认值。
+    const bool parity_ok = (parity == SerialParity::none || parity == SerialParity::odd
+                            || parity == SerialParity::even);
+    const bool stop_ok   = (stop_bits == SerialStopBits::one
+                            || stop_bits == SerialStopBits::two);
+    return parity_ok && stop_ok && data_bits >= 5 && data_bits <= 8;
+}
+
+void apply_serial_params(SerialParity parity, SerialStopBits stop_bits,
+                         std::uint8_t data_bits, netmech::SerialConfig& sc)
+{
+    sc.data_bits = data_bits;
+    // 显式映射而不是 static_cast，免得将来任一侧加值域时静默错位。
+    switch (parity) {
+    case SerialParity::none: sc.parity = netmech::SerialParity::none; break;
+    case SerialParity::odd:  sc.parity = netmech::SerialParity::odd;  break;
+    case SerialParity::even: sc.parity = netmech::SerialParity::even; break;
+    }
+    switch (stop_bits) {
+    case SerialStopBits::one: sc.stop_bits = netmech::SerialStopBits::one; break;
+    case SerialStopBits::two: sc.stop_bits = netmech::SerialStopBits::two; break;
+    }
+}
+
+
 // =============================================================================
 //  Handler：netmech 的串口事件
 // =============================================================================
-
 class RtuTransport::Handler final : public netmech::SerialHandler {
 public:
     explicit Handler(std::shared_ptr<RtuTransport> owner) : m_owner(std::move(owner)) {}
@@ -137,15 +198,20 @@ std::shared_ptr<RtuTransport> RtuTransport::create(const std::string& device,
 {
     ec.clear();
 
+    // 串口参数校验：data_bits 5~8；枚举值必须在值域内（防止调用方
+    // static_cast 出非法值被静默当成默认值）。
+    if (!serial_params_valid(cfg.parity, cfg.stop_bits, cfg.data_bits)) {
+        ec = make_error_code(ModbusErrc::invalid_argument);
+        return nullptr;
+    }
+
     auto self = std::shared_ptr<RtuTransport>(new RtuTransport());
     self->m_cfg = cfg;
 
     netmech::SerialConfig sc;
     sc.device    = device;
     sc.baud_rate = cfg.baud_rate;
-    sc.data_bits = cfg.data_bits;
-    sc.parity    = netmech::SerialParity::none;
-    sc.stop_bits = netmech::SerialStopBits::one;
+    apply_serial_params(cfg.parity, cfg.stop_bits, cfg.data_bits, sc);
 
     auto handler = std::make_shared<Handler>(self);
     self->m_port = netmech::SerialPort::create(sc, handler, ec);
@@ -166,8 +232,39 @@ void RtuTransport::on_bytes(const std::uint8_t* data, std::size_t n)
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_rx.insert(m_rx.end(), data, data + n);
+        m_last_rx = std::chrono::steady_clock::now();
     }
     m_cv.notify_all();
+}
+
+void RtuTransport::resync()
+{
+    // 等到"线路连续安静 silence_ms"为止，期间到达的字节一律丢弃。
+    //
+    // 为什么需要：RTU 没有事务号。一次请求超时后，从站的**迟到响应**可能在
+    // 下一笔请求期间到达，而 receive() 只能按"地址 + 功能码 + 长度"认帧 ——
+    // 轮询同一从站、同一功能码时这三者必然相同，迟到响应就会被当成这次的
+    // 响应，静默返回上一轮的寄存器值（后果比报错严重得多）。
+    //
+    // 代价：只在**传输失败之后**调用。线路本来就没数据时 m_last_rx 早已过期，
+    // 这里立即返回，正常路径不付任何延迟。
+    const auto quiet    = std::chrono::milliseconds(m_cfg.silence_ms);
+    const auto cap      = std::chrono::milliseconds(50);   // 防止对端一直发导致卡住
+    const auto deadline = std::chrono::steady_clock::now() + cap;
+
+    std::unique_lock<std::mutex> lk(m_mtx);
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        m_rx.clear();                                     // 已经到的，全部丢掉
+        if (m_closed || now >= deadline) {
+            return;
+        }
+        const auto quiet_until = m_last_rx + quiet;
+        if (now >= quiet_until) {
+            return;                                       // 线路已经安静够久
+        }
+        m_cv.wait_until(lk, (std::min)(quiet_until, deadline));
+    }
 }
 
 void RtuTransport::flush_input()
@@ -176,15 +273,25 @@ void RtuTransport::flush_input()
     m_rx.clear();
 }
 
-std::error_code RtuTransport::send(span<const std::uint8_t> pdu, std::uint8_t unit)
+std::error_code RtuTransport::send(span<const std::uint8_t> pdu, std::uint8_t unit,
+                                   std::uint16_t& tid)
 {
+    tid = 0;   // RTU 没有事务号
     if (!is_open()) {
         return make_error_code(ModbusErrc::not_connected);
     }
 
     // RTU 的封装在这里做：地址 + PDU + CRC16
-    const std::vector<std::uint8_t> frame = detail::wrap_rtu(unit, pdu);
-    if (!m_port->write(netmech::ConstBuf{nullptr, frame.data(), frame.size()})) {
+    //
+    // ★ 必须用 owner 把帧交给 netmech 托管：串口写是**异步**的，netmech 只把
+    //   指针排进发送队列（netmech 的 SerialPort::write 不拷贝数据），等内核
+    //   真正取数据时本函数早已返回。以前这里传的是局部 vector + 空 owner，
+    //   一旦上一笔写还没回调、本笔被排队，稍后就会从已释放的内存取数据（UAF）。
+    //   用 shared_ptr 当 owner 是 O(1) 的引用计数开销，换生命周期正确 ——
+    //   与 tcp.cpp 的发送路径保持同一写法。
+    auto frame = std::make_shared<std::vector<std::uint8_t>>(
+        detail::wrap_rtu(unit, pdu));
+    if (!m_port->write(netmech::ConstBuf{frame, frame->data(), frame->size()})) {
         return make_error_code(ModbusErrc::io_error);
     }
     return {};
@@ -192,7 +299,7 @@ std::error_code RtuTransport::send(span<const std::uint8_t> pdu, std::uint8_t un
 
 std::error_code RtuTransport::receive(std::vector<std::uint8_t>& out,
                                       std::chrono::milliseconds timeout,
-                                      std::uint8_t unit)
+                                      std::uint8_t unit, std::uint16_t /*tid*/)
 {
     out.clear();
 

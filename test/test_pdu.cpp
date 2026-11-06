@@ -322,3 +322,36 @@ NETMECH_TEST(pdu_encode_exception_response)
     const Bytes want{0x83, 0x02};
     CHECK(pdu == want);
 }
+
+// ---------------------------------------------------------------------------
+// 19. decode_pdu：0F/10 的 byte count 必须与 count 精确匹配
+//
+//     回归：以前只校验"缓冲够长"，bc 比 count 少时缺的位会被 unpack_bits
+//     静默解成 0，从站于是把那段地址的线圈/寄存器真的写成 0（协议规定畸形
+//     请求不能执行写）。现在少一个字节就判 bad_length，从站丢弃并不执行。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(pdu_decode_rejects_bc_count_mismatch)
+{
+    DecodedPdu d;
+
+    // 0F：count=16 需要 2 字节数据，bc=1 ⇒ 拒
+    const Bytes coils_short{0x0F, 0x00, 0x00, 0x00, 0x10, 0x01, 0xFF};
+    CHECK(decode_pdu(sp(coils_short), d) == ModbusErrc::bad_length);
+
+    // 0F：count=10 需要 2 字节，bc=2 ⇒ 收（合法，别误杀）
+    const Bytes coils_ok{0x0F, 0x00, 0x00, 0x00, 0x0A, 0x02, 0xFF, 0x03};
+    CHECK(!decode_pdu(sp(coils_ok), d));
+    CHECK_EQ(d.count, 10);
+    CHECK_EQ(d.bits.size(), std::size_t{10});
+
+    // 10：count=2 需要 4 字节数据，bc=2 ⇒ 拒
+    const Bytes regs_short{0x10, 0x00, 0x00, 0x00, 0x02, 0x02, 0x12, 0x34};
+    CHECK(decode_pdu(sp(regs_short), d) == ModbusErrc::bad_length);
+
+    // 10：count=2，bc=4 ⇒ 收
+    const Bytes regs_ok{0x10, 0x00, 0x00, 0x00, 0x02, 0x04,
+                        0x12, 0x34, 0x56, 0x78};
+    CHECK(!decode_pdu(sp(regs_ok), d));
+    CHECK_EQ(d.registers.size(), std::size_t{2});
+    CHECK_EQ(d.registers[0], 0x1234);
+}

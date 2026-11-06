@@ -18,6 +18,7 @@
 #include <cstring>
 #include <thread>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 #include <cstddef>
 #include <cstdint>
@@ -75,55 +76,55 @@ public:
         m_discrete[5] = true;
     }
 
-    bool read_coils(std::uint16_t a, std::uint16_t n, std::vector<bool>& out) override
+    bool read_coils(std::uint8_t /*unit*/, std::uint16_t a, std::uint16_t n, std::vector<bool>& out) override
     {
         if (a + n > m_coils.size()) { return false; }
         out.assign(m_coils.begin() + a, m_coils.begin() + a + n);
         return true;
     }
-    bool read_discrete_inputs(std::uint16_t a, std::uint16_t n,
+    bool read_discrete_inputs(std::uint8_t /*unit*/, std::uint16_t a, std::uint16_t n,
                               std::vector<bool>& out) override
     {
         if (a + n > m_discrete.size()) { return false; }
         out.assign(m_discrete.begin() + a, m_discrete.begin() + a + n);
         return true;
     }
-    bool read_holding_registers(std::uint16_t a, std::uint16_t n,
+    bool read_holding_registers(std::uint8_t /*unit*/, std::uint16_t a, std::uint16_t n,
                                 std::vector<std::uint16_t>& out) override
     {
         if (a + n > m_holding.size()) { return false; }
         out.assign(m_holding.begin() + a, m_holding.begin() + a + n);
         return true;
     }
-    bool read_input_registers(std::uint16_t a, std::uint16_t n,
+    bool read_input_registers(std::uint8_t /*unit*/, std::uint16_t a, std::uint16_t n,
                               std::vector<std::uint16_t>& out) override
     {
         if (a + n > m_input.size()) { return false; }
         out.assign(m_input.begin() + a, m_input.begin() + a + n);
         return true;
     }
-    bool write_single_coil(std::uint16_t a, bool v) override
+    bool write_single_coil(std::uint8_t /*unit*/, std::uint16_t a, bool v) override
     {
         if (a >= m_coils.size()) { return false; }
         m_coils[a] = v;
         ++write_count;
         return true;
     }
-    bool write_single_register(std::uint16_t a, std::uint16_t v) override
+    bool write_single_register(std::uint8_t /*unit*/, std::uint16_t a, std::uint16_t v) override
     {
         if (a >= m_holding.size()) { return false; }
         m_holding[a] = v;
         ++write_count;
         return true;
     }
-    bool write_multiple_coils(std::uint16_t a, const std::vector<bool>& v) override
+    bool write_multiple_coils(std::uint8_t /*unit*/, std::uint16_t a, const std::vector<bool>& v) override
     {
         if (a + v.size() > m_coils.size()) { return false; }
         for (std::size_t i = 0; i < v.size(); ++i) { m_coils[a + i] = v[i]; }
         ++write_count;
         return true;
     }
-    bool write_multiple_registers(std::uint16_t a,
+    bool write_multiple_registers(std::uint8_t /*unit*/, std::uint16_t a,
                                   const std::vector<std::uint16_t>& v) override
     {
         if (a + v.size() > m_holding.size()) { return false; }
@@ -414,32 +415,32 @@ class ConstBank final : public RegisterBank {
 public:
     explicit ConstBank(std::uint16_t v) : m_v(v) {}
 
-    bool read_coils(std::uint16_t, std::uint16_t n, std::vector<bool>& out) override
+    bool read_coils(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n, std::vector<bool>& out) override
     {
         out.assign(n, m_v != 0);
         return true;
     }
-    bool read_discrete_inputs(std::uint16_t, std::uint16_t n, std::vector<bool>& out) override
+    bool read_discrete_inputs(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n, std::vector<bool>& out) override
     {
         out.assign(n, m_v != 0);
         return true;
     }
-    bool read_holding_registers(std::uint16_t, std::uint16_t n,
+    bool read_holding_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n,
                                 std::vector<std::uint16_t>& out) override
     {
         out.assign(n, m_v);
         return true;
     }
-    bool read_input_registers(std::uint16_t, std::uint16_t n,
+    bool read_input_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n,
                               std::vector<std::uint16_t>& out) override
     {
         out.assign(n, m_v);
         return true;
     }
-    bool write_single_coil(std::uint16_t, bool) override { return true; }
-    bool write_single_register(std::uint16_t, std::uint16_t) override { return true; }
-    bool write_multiple_coils(std::uint16_t, const std::vector<bool>&) override { return true; }
-    bool write_multiple_registers(std::uint16_t, const std::vector<std::uint16_t>&) override
+    bool write_single_coil(std::uint8_t /*unit*/, std::uint16_t, bool) override { return true; }
+    bool write_single_register(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t) override { return true; }
+    bool write_multiple_coils(std::uint8_t /*unit*/, std::uint16_t, const std::vector<bool>&) override { return true; }
+    bool write_multiple_registers(std::uint8_t /*unit*/, std::uint16_t, const std::vector<std::uint16_t>&) override
     {
         return true;
     }
@@ -454,7 +455,7 @@ private:
 /// ★ 每个方法开头都复位 m_exc —— 这是 last_exception 的正确用法，库不会代劳。
 class EmptyEventQueueBank final : public RegisterBank {
 public:
-    bool read_input_registers(std::uint16_t, std::uint16_t,
+    bool read_input_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t,
                               std::vector<std::uint16_t>&) override
     {
         m_exc = Exception::illegal_data_value;   // 01 84 03
@@ -462,38 +463,38 @@ public:
     }
     Exception last_exception() const override { return m_exc; }
 
-    bool read_coils(std::uint16_t, std::uint16_t, std::vector<bool>&) override
+    bool read_coils(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t, std::vector<bool>&) override
     {
         m_exc = Exception::none;
         return false;
     }
-    bool read_discrete_inputs(std::uint16_t, std::uint16_t, std::vector<bool>&) override
+    bool read_discrete_inputs(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t, std::vector<bool>&) override
     {
         m_exc = Exception::none;
         return false;
     }
-    bool read_holding_registers(std::uint16_t, std::uint16_t,
+    bool read_holding_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t,
                                 std::vector<std::uint16_t>&) override
     {
         m_exc = Exception::none;
         return false;
     }
-    bool write_single_coil(std::uint16_t, bool) override
+    bool write_single_coil(std::uint8_t /*unit*/, std::uint16_t, bool) override
     {
         m_exc = Exception::none;
         return false;
     }
-    bool write_single_register(std::uint16_t, std::uint16_t) override
+    bool write_single_register(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t) override
     {
         m_exc = Exception::none;
         return false;
     }
-    bool write_multiple_coils(std::uint16_t, const std::vector<bool>&) override
+    bool write_multiple_coils(std::uint8_t /*unit*/, std::uint16_t, const std::vector<bool>&) override
     {
         m_exc = Exception::none;
         return false;
     }
-    bool write_multiple_registers(std::uint16_t, const std::vector<std::uint16_t>&) override
+    bool write_multiple_registers(std::uint8_t /*unit*/, std::uint16_t, const std::vector<std::uint16_t>&) override
     {
         m_exc = Exception::none;
         return false;
@@ -501,6 +502,140 @@ public:
 
 private:
     mutable Exception m_exc = Exception::none;
+};
+
+/// 读保持寄存器时**直接抛异常**（应用实现里很常见的写法：内部校验失败、
+/// std::bad_alloc、查表抛 std::out_of_range …）。
+///
+/// 用来验证设计文档 §8.2 的承诺：bank 抛异常 ⇒ 库捕获 ⇒ 回 04（从站故障），
+/// 且从站本身继续存活。其余功能码正常应答，好让测试能证明"异常之后还活着"。
+class ThrowingBank final : public RegisterBank {
+public:
+    bool read_coils(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n, std::vector<bool>& out) override
+    {
+        out.assign(n, true);
+        return true;
+    }
+    bool read_discrete_inputs(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n,
+                              std::vector<bool>& out) override
+    {
+        out.assign(n, false);
+        return true;
+    }
+    bool read_holding_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t,
+                                std::vector<std::uint16_t>&) override
+    {
+        throw std::runtime_error("bank 内部故障（测试用）");
+    }
+    bool read_input_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n,
+                              std::vector<std::uint16_t>& out) override
+    {
+        out.assign(n, 0);
+        return true;
+    }
+    bool write_single_coil(std::uint8_t /*unit*/, std::uint16_t, bool) override { return true; }
+    bool write_single_register(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t) override { return true; }
+    bool write_multiple_coils(std::uint8_t /*unit*/, std::uint16_t, const std::vector<bool>&) override { return true; }
+    bool write_multiple_registers(std::uint8_t /*unit*/, std::uint16_t,
+                                  const std::vector<std::uint16_t>&) override
+    {
+        return true;
+    }
+};
+
+/// 读操作**少返回一个**（违反 "out 的 size 会被设为 count" 的契约）。
+/// 库必须把这种响应拦下来回 04，而不是发一个 byte count 与请求对不上的帧。
+class ShortBank final : public RegisterBank {
+public:
+    bool read_coils(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n, std::vector<bool>& out) override
+    {
+        out.assign(n > 0 ? n - 1u : 0u, false);   // 故意少一个
+        return true;
+    }
+    bool read_discrete_inputs(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n,
+                              std::vector<bool>& out) override
+    {
+        out.assign(n, false);
+        return true;
+    }
+    bool read_holding_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n,
+                                std::vector<std::uint16_t>& out) override
+    {
+        out.assign(n > 0 ? n - 1u : 0u, 0);      // 故意少一个
+        return true;
+    }
+    bool read_input_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t n,
+                              std::vector<std::uint16_t>& out) override
+    {
+        out.assign(n, 0);
+        return true;
+    }
+    bool write_single_coil(std::uint8_t /*unit*/, std::uint16_t, bool) override { return true; }
+    bool write_single_register(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t) override { return true; }
+    bool write_multiple_coils(std::uint8_t /*unit*/, std::uint16_t, const std::vector<bool>&) override { return true; }
+    bool write_multiple_registers(std::uint8_t /*unit*/, std::uint16_t,
+                                  const std::vector<std::uint16_t>&) override
+    {
+        return true;
+    }
+};
+
+/// 记录"最近一次回调收到的 unit" —— 验证库把请求里的 unit 透传给了 bank。
+/// 多从站/透传场景靠这个参数区分设备，所以它是公共契约的一部分。
+class UnitRecordingBank final : public RegisterBank {
+public:
+    std::atomic<int> last_unit{-1};
+
+    bool read_coils(std::uint8_t unit, std::uint16_t, std::uint16_t n,
+                    std::vector<bool>& out) override
+    {
+        last_unit.store(unit);
+        out.assign(n, false);
+        return true;
+    }
+    bool read_discrete_inputs(std::uint8_t unit, std::uint16_t, std::uint16_t n,
+                              std::vector<bool>& out) override
+    {
+        last_unit.store(unit);
+        out.assign(n, false);
+        return true;
+    }
+    bool read_holding_registers(std::uint8_t unit, std::uint16_t, std::uint16_t n,
+                                std::vector<std::uint16_t>& out) override
+    {
+        last_unit.store(unit);
+        out.assign(n, 0);
+        return true;
+    }
+    bool read_input_registers(std::uint8_t unit, std::uint16_t, std::uint16_t n,
+                              std::vector<std::uint16_t>& out) override
+    {
+        last_unit.store(unit);
+        out.assign(n, 0);
+        return true;
+    }
+    bool write_single_coil(std::uint8_t unit, std::uint16_t, bool) override
+    {
+        last_unit.store(unit);
+        return true;
+    }
+    bool write_single_register(std::uint8_t unit, std::uint16_t, std::uint16_t) override
+    {
+        last_unit.store(unit);
+        return true;
+    }
+    bool write_multiple_coils(std::uint8_t unit, std::uint16_t,
+                              const std::vector<bool>&) override
+    {
+        last_unit.store(unit);
+        return true;
+    }
+    bool write_multiple_registers(std::uint8_t unit, std::uint16_t,
+                                  const std::vector<std::uint16_t>&) override
+    {
+        last_unit.store(unit);
+        return true;
+    }
 };
 
 } // namespace
@@ -635,6 +770,298 @@ NETMECH_TEST(slave_custom_exception_code)
     REQUIRE(r2.size() >= 5u);
     CHECK_EQ(r2[1], 0x83);
     CHECK_EQ(r2[2], 0x02);
+
+    slave->stop();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 9. bank 抛异常：必须收敛成 04（从站故障），且从站继续存活
+//
+//    回归测试。以前 handle_pdu 里没有 try/catch：RTU 的 handle_frame 跑在独立
+//    线程里，异常穿出 run() ⇒ std::terminate（整个进程直接死）；TCP 侧则会被
+//    netmech 的 invoke_void 吞掉、跳过 on_read 末尾的 start_read() ⇒ 会话僵死。
+//    设计文档 §8.2 的承诺是"库捕获 → 回 04（server_device_failure）并记
+//    stats.exceptions"，这里按承诺断言这三件事。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_bank_exception_becomes_04)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    auto bank = std::make_shared<ThrowingBank>();
+
+    Slave::Config sc;
+    sc.address    = 1;
+    sc.silence_ms = 5;
+
+    std::error_code ec;
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    // ① 读保持寄存器 ⇒ bank 抛异常 ⇒ 应回 83 04
+    const auto r1 = slave_exchange(pty, {0x01, 0x03, 0x00, 0x00, 0x00, 0x01}, 5);
+    REQUIRE(r1.size() >= 5u);
+    CHECK_EQ(r1[0], 0x01);
+    CHECK_EQ(r1[1], 0x83);   // 功能码 | 0x80
+    CHECK_EQ(r1[2], 0x04);   // server_device_failure
+
+    // ② 从站必须还活着：换一个功能码（01 读线圈）应正常应答
+    //    这一条是"异常没有把帧线程带走"的直接证据
+    const auto r2 = slave_exchange(pty, {0x01, 0x01, 0x00, 0x00, 0x00, 0x08}, 6);
+    REQUIRE(r2.size() >= 6u);
+    CHECK_EQ(r2[1], 0x01);   // 正常响应，功能码最高位为 0
+    CHECK_EQ(r2[2], 0x01);   // 8 个线圈 = 1 字节
+
+    // ③ 统计口径：异常帧被计入 exceptions（且只计一次）
+    CHECK_EQ(slave->stats().exceptions, std::uint64_t{1});
+    CHECK(slave->is_running());
+
+    slave->stop();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 10. bank 返回的 size 与请求的 count 不符 ⇒ 回 04，不能发畸形帧
+//
+//     回归：以前直接把 bank 给的 size 写进 byte count。少返回一个 ⇒ 帧的
+//     byte count 与请求对不上（对端判 bad_length）；多返回 ⇒ 字节数溢出
+//     uint8_t（例如 200 个寄存器 × 2 = 400 截断成 0x90）。现在统一按
+//     server_device_failure（04）拒绝，不发错帧。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_bank_wrong_size_becomes_04)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    auto bank = std::make_shared<ShortBank>();
+
+    Slave::Config sc;
+    sc.address    = 1;
+    sc.silence_ms = 5;
+
+    std::error_code ec;
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    // ① 请求 4 个保持寄存器，bank 只给 3 个 ⇒ 83 04
+    const auto r = slave_exchange(pty, {0x01, 0x03, 0x00, 0x00, 0x00, 0x04}, 5);
+    REQUIRE(r.size() >= 5u);
+    CHECK_EQ(r[1], 0x83);
+    CHECK_EQ(r[2], 0x04);
+
+    // ② 读线圈同样少一个 ⇒ 81 04
+    const auto r2 = slave_exchange(pty, {0x01, 0x01, 0x00, 0x00, 0x00, 0x08}, 5);
+    REQUIRE(r2.size() >= 5u);
+    CHECK_EQ(r2[1], 0x81);
+    CHECK_EQ(r2[2], 0x04);
+
+    slave->stop();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 11. length 帧边界：两帧粘在一起也要各切一次
+//
+//     silence 模式靠"线路安静"切帧：16 字节连发会被当成一帧（CRC 全错 → 丢弃）。
+//     length 模式按功能码推出的长度切，必须得到**两个**响应。这条用例是
+//     Config::boundary 落到实现的直接证据（以前这个字段只有枚举、没有实现）。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_length_boundary_cuts_glued_frames)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    auto bank = std::make_shared<TestBank>();
+
+    Slave::Config sc;
+    sc.address    = 1;
+    sc.boundary   = Slave::Config::FrameBoundary::length;
+    sc.silence_ms = 5;
+
+    std::error_code ec;
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    // 两条完全相同的读请求（各 8 字节），一次性怼进 pty
+    std::vector<std::uint8_t> burst;
+    for (int i = 0; i < 2; ++i) {
+        std::vector<std::uint8_t> req = {0x01, 0x03, 0x00, 0x00, 0x00, 0x01};
+        const std::uint16_t c =
+            crc16(span<const std::uint8_t>(req.data(), req.size()));
+        req.push_back(static_cast<std::uint8_t>(c & 0xFF));
+        req.push_back(static_cast<std::uint8_t>((c >> 8) & 0xFF));
+        burst.insert(burst.end(), req.begin(), req.end());
+    }
+    REQUIRE(::write(pty.master, burst.data(), burst.size())
+            == static_cast<ssize_t>(burst.size()));
+
+    // 收两个响应：各 7 字节（地址 + 功能码 + 字节数 + 2 字节数据 + CRC）
+    std::vector<std::uint8_t> resp;
+    std::uint8_t              buf[64];
+    const auto deadline = std::chrono::steady_clock::now() + 500ms;
+    while (std::chrono::steady_clock::now() < deadline && resp.size() < 14u) {
+        const ssize_t r = ::read(pty.master, buf, sizeof(buf));
+        if (r > 0) {
+            resp.insert(resp.end(), buf, buf + r);
+        } else {
+            std::this_thread::sleep_for(1ms);
+        }
+    }
+    REQUIRE(resp.size() >= 14u);
+    CHECK_EQ(resp[0], 0x01);
+    CHECK_EQ(resp[1], 0x03);
+    CHECK_EQ(resp[2], 0x02);   // 1 个寄存器 = 2 字节
+    CHECK_EQ(resp[7], 0x01);   // 第二个响应也必须从"地址"开始
+    CHECK_EQ(resp[8], 0x03);
+    CHECK_EQ(resp[9], 0x02);
+
+    slave->stop();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 12. 串口参数校验：非法 data_bits ⇒ invalid_argument（不依赖 pty，跨平台）
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_rejects_bad_serial_params)
+{
+    Slave::Config sc;
+    sc.bank_for  = [](std::uint8_t) -> std::shared_ptr<RegisterBank> { return nullptr; };
+    sc.data_bits = 9;                       // 只支持 5~8
+
+    std::error_code ec;
+    auto s = Slave::create_rtu("/dev/null", 9600, sc, nullptr, ec);
+    CHECK(s == nullptr);
+    CHECK_EQ(ec, make_error_code(ModbusErrc::invalid_argument));
+}
+
+// ---------------------------------------------------------------------------
+// 13. 未知功能码 ⇒ 回 01（illegal_function），而不是静默丢弃
+//
+//     规范 V1.1b3 §7：功能码不支持时从站要回"功能码|0x80 + 01"。以前
+//     decode_pdu 把它当畸形帧（invalid_argument），handle_pdu 直接丢 ——
+//     主站只能等超时，分不清"不支持"和"没响应"。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_unknown_function_returns_01)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    auto bank = std::make_shared<TestBank>();
+
+    Slave::Config sc;
+    sc.address    = 1;
+    sc.silence_ms = 5;
+
+    std::error_code ec;
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    // 功能码 0x2B（读设备标识，本库不支持）：01 2B 0E 01 00 + CRC
+    const auto r = slave_exchange(pty, {0x01, 0x2B, 0x0E, 0x01, 0x00}, 5);
+    REQUIRE(r.size() >= 5u);
+    CHECK_EQ(r[0], 0x01);   // 地址回显
+    CHECK_EQ(r[1], 0xAB);   // 功能码 | 0x80
+    CHECK_EQ(r[2], 0x01);   // illegal_function
+
+    slave->stop();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 14. bank_for 抛异常不能打死从站
+//
+//     bank_for 是应用回调（多从站分派用）。它抛异常时：RTU 侧异常会打断帧
+//     线程（外层兜底一开，从站就停摆），TCP 侧会关掉连接。现在的语义是
+//     "当作该 unit 不存在"：这一帧静默丢弃、bad_frames +1，从站继续服务。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_bank_for_exception_does_not_kill_slave)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    auto bank  = std::make_shared<TestBank>();
+
+    Slave::Config sc;
+    sc.address    = 1;
+    sc.silence_ms = 5;
+    sc.bank_for   = [calls, bank](std::uint8_t) -> std::shared_ptr<RegisterBank> {
+        if (calls->fetch_add(1) == 0) {
+            throw std::runtime_error("bank_for 内部故障（测试用）");
+        }
+        return bank;
+    };
+
+    std::error_code ec;
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, nullptr, ec);
+    REQUIRE(slave != nullptr);
+
+    // ① 第一次：bank_for 抛异常 ⇒ 该帧丢弃（不应答），但从站不能死
+    const auto r1 = slave_exchange(pty, {0x01, 0x03, 0x00, 0x00, 0x00, 0x01}, 0, 200ms);
+    CHECK(r1.empty());
+
+    // ② 第二次：bank_for 正常返回 ⇒ 正常应答（证明帧线程还活着）
+    const auto r2 = slave_exchange(pty, {0x01, 0x03, 0x00, 0x00, 0x00, 0x01}, 7);
+    REQUIRE(r2.size() >= 7u);
+    CHECK_EQ(r2[1], 0x03);
+
+    CHECK(slave->is_running());
+    CHECK(slave->stats().bad_frames >= 1u);
+
+    slave->stop();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 15. unit 透传给 RegisterBank：多从站 / 协议透传场景靠它区分设备
+//
+//     以前 bank 的回调只有 (address, count/value)，拿不到"这一帧是哪个设备
+//     要的"。用一个 bank 服务多个 unit（或做网关透传）时必须知道 unit，所以
+//     它现在是公共契约的一部分。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(slave_passes_unit_to_bank)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    auto bank = std::make_shared<UnitRecordingBank>();
+
+    Slave::Config sc;
+    sc.addresses  = {1, 2};   // 一个串口模拟两台从站，共用同一个 bank
+    sc.silence_ms = 5;
+
+    std::error_code ec;
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+
+    // 请求 unit=2 ⇒ bank 必须看到 2
+    const auto r2 = slave_exchange(pty, {0x02, 0x03, 0x00, 0x00, 0x00, 0x01}, 7);
+    REQUIRE(r2.size() >= 7u);
+    CHECK_EQ(bank->last_unit.load(), 2);
+
+    // 请求 unit=1 ⇒ bank 必须看到 1（而不是 cfg.address）
+    const auto r1 = slave_exchange(pty, {0x01, 0x03, 0x00, 0x00, 0x00, 0x01}, 7);
+    REQUIRE(r1.size() >= 7u);
+    CHECK_EQ(bank->last_unit.load(), 1);
 
     slave->stop();
 #else
