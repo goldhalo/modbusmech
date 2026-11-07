@@ -73,6 +73,22 @@ add_subdirectory("${MODBUSMECH_NETMECH_DIR}" "${CMAKE_BINARY_DIR}/netmech" EXCLU
 file(GLOB MODBUSMECH_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 add_library(modbusmech ${MODBUSMECH_SOURCES})
 add_library(modbusmech::modbusmech ALIAS modbusmech)
+
+# ---------------------------------------------------------------------------
+# 发布成动态库（-DBUILD_SHARED_LIBS=ON）时的符号卫生
+#
+# netmech 是**静态**链入本库的：它的线程池/asio 状态会随本 .so 一起打包。
+# 默认可见性下，netmech 的内部符号会全部从本 .so 导出（实测 257 个）——
+# 既污染 ABI，也可能被同进程其它模块的符号解析"撞上"。这里把静态库符号隐藏，
+# 只导出本库自己的符号（Linux/macOS）。
+#
+# Windows 需要显式 MODBUSMECH_API 导出宏（本库尚未加；见 README「发布为动态库」）。
+# ---------------------------------------------------------------------------
+if(BUILD_SHARED_LIBS AND (UNIX AND NOT APPLE))
+    target_link_options(modbusmech PRIVATE "-Wl,--exclude-libs,ALL")
+elseif(BUILD_SHARED_LIBS AND APPLE)
+    target_link_options(modbusmech PRIVATE "-Wl,-hidden-lsymbols")
+endif()
 set_target_properties(modbusmech PROPERTIES
     POSITION_INDEPENDENT_CODE ${MODBUSMECH_PIC})
 target_include_directories(modbusmech PUBLIC

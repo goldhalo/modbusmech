@@ -336,3 +336,21 @@ target_link_libraries(app PRIVATE modbusmech::modbusmech)
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
+
+## 发布为动态库（`-DBUILD_SHARED_LIBS=ON`）
+
+modbusmech 默认构建静态库；也可以构建动态库，**netmech 始终静态链入**（不产生额外的
+运行时依赖）。要点：
+
+1. **io 线程归属**：线程池在 `libmodbusmech.so` 内部，归本库所有；同进程其它模块
+   若各自静态链接 netmech，会各有一套线程池（**跨副本混用同一个 io_context 会崩**，
+   多模块共用请让 netmech 以共享库形式被共用）。
+2. **对外发布不需要 netmech 的二进制**，但需保留 netmech 的 MIT LICENSE 声明
+   （静态链接属于分发，MIT 要求保留版权与许可文本）。
+3. **符号卫生**：Linux/macOS 构建共享库时已用 `-Wl,--exclude-libs,ALL` 隐藏
+   静态链入的 netmech 符号；Windows 需要在公共 API 上加导出宏（`MODBUSMECH_API`），
+   **尚未实现** —— 在补齐之前，Windows 动态库不保证能正确导出/导入。
+4. **卸载（dlclose）前**必须 `close()` 全部对象并 `netmech::shutdown()`：
+   io 线程运行在 `.so` 的代码里，卸载后线程再执行会崩。进程正常退出时有兜底
+   （静态析构里 join 线程）。
+5. netmech 必须以 PIC 编译（`NETMECH_PIC` 默认 ON）。
