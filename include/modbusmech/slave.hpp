@@ -18,6 +18,9 @@
 // =============================================================================
 #pragma once
 
+namespace netmech { class Runtime; }
+
+
 #include "modbusmech/export.hpp"
 
 #include <chrono>
@@ -244,7 +247,8 @@ public:
     [[nodiscard]] static std::shared_ptr<Slave>
     create_rtu(const std::string& device, std::uint32_t baud_rate,
                const Config& cfg, std::shared_ptr<RegisterBank> bank,
-               std::error_code& ec);
+               std::error_code& ec,
+               std::shared_ptr<netmech::Runtime> runtime = nullptr);
 
     /// TCP 从站（服务端，**支持多个客户端**）。
     ///
@@ -254,7 +258,8 @@ public:
     ///       线程安全（或者接受并发读写的语义）。
     [[nodiscard]] static std::shared_ptr<Slave>
     create_tcp(std::uint16_t port, const Config& cfg,
-               std::shared_ptr<RegisterBank> bank, std::error_code& ec);
+               std::shared_ptr<RegisterBank> bank, std::error_code& ec,
+               std::shared_ptr<netmech::Runtime> runtime = nullptr);
 
     ~Slave();
     Slave(const Slave&) = delete;

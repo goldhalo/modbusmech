@@ -223,7 +223,8 @@ AsyncMaster::~AsyncMaster()
 std::shared_ptr<AsyncMaster> AsyncMaster::create_tcp(const std::string& host,
                                                      std::uint16_t port,
                                                      const Config& cfg,
-                                                     std::error_code& ec)
+                                                     std::error_code& ec,
+                                                     std::shared_ptr<netmech::Runtime> runtime)
 {
     ec.clear();
 
@@ -236,7 +237,7 @@ std::shared_ptr<AsyncMaster> AsyncMaster::create_tcp(const std::string& host,
     mc.connect_timeout  = cfg.connect_timeout;
     mc.max_in_flight    = cfg.max_workers == 0 ? 1u : cfg.max_workers;
 
-    auto master = Master::create_tcp(host, port, mc, ec);
+    auto master = Master::create_tcp(host, port, mc, ec, std::move(runtime));
     if (!master) {
         return nullptr;
     }

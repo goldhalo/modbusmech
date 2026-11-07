@@ -31,6 +31,9 @@
 // =============================================================================
 #pragma once
 
+namespace netmech { class Runtime; }
+
+
 #include "modbusmech/export.hpp"
 
 #include <chrono>
@@ -121,12 +124,14 @@ public:
     /// @param[out] ec    失败原因
     [[nodiscard]] static std::shared_ptr<Master>
     create_rtu(const std::string& device, const Config& cfg,
-               std::uint32_t baud_rate, std::error_code& ec);
+               std::uint32_t baud_rate, std::error_code& ec,
+               std::shared_ptr<netmech::Runtime> runtime = nullptr);
 
     /// TCP 主站（客户端）。
     [[nodiscard]] static std::shared_ptr<Master>
     create_tcp(const std::string& host, std::uint16_t port, const Config& cfg,
-               std::error_code& ec);
+               std::error_code& ec,
+               std::shared_ptr<netmech::Runtime> runtime = nullptr);
 
     ~Master();
     Master(const Master&) = delete;

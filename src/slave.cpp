@@ -813,7 +813,8 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
                                          std::uint32_t baud_rate,
                                          const Config& cfg,
                                          std::shared_ptr<RegisterBank> bank,
-                                         std::error_code& ec)
+                                         std::error_code& ec,
+                                         std::shared_ptr<netmech::Runtime> runtime)
 {
     ec.clear();
 
@@ -853,7 +854,7 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
     detail::apply_serial_params(cfg.parity, cfg.stop_bits, cfg.data_bits, sc);
 
     auto sink = std::make_shared<Impl::SerialSink>(impl);
-    impl->port = netmech::SerialPort::create(sc, sink, ec);
+    impl->port = netmech::SerialPort::create(sc, sink, std::move(runtime), ec);
     if (!impl->port) {
         return nullptr;
     }
@@ -879,7 +880,8 @@ std::shared_ptr<Slave> Slave::create_rtu(const std::string& device,
 std::shared_ptr<Slave> Slave::create_tcp(std::uint16_t port,
                                          const Config& cfg,
                                          std::shared_ptr<RegisterBank> bank,
-                                         std::error_code& ec)
+                                         std::error_code& ec,
+                                         std::shared_ptr<netmech::Runtime> runtime)
 {
     ec.clear();
 
@@ -893,7 +895,8 @@ std::shared_ptr<Slave> Slave::create_tcp(std::uint16_t port,
     impl->cfg  = cfg;
     impl->bank = std::move(bank);
 
-    impl->mech = netmech::Mechanism::create();
+    impl->mech = netmech::Mechanism::create(netmech::Mechanism::Config{},
+                                            std::move(runtime));
     if (!impl->mech) {
         ec = make_error_code(ModbusErrc::io_error);
         return nullptr;

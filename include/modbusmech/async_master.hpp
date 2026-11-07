@@ -31,6 +31,9 @@
 // =============================================================================
 #pragma once
 
+namespace netmech { class Runtime; }
+
+
 #include "modbusmech/export.hpp"
 
 #include <chrono>
@@ -78,7 +81,8 @@ public:
     /// 创建 TCP 异步主站。
     [[nodiscard]] static std::shared_ptr<AsyncMaster>
     create_tcp(const std::string& host, std::uint16_t port, const Config& cfg,
-               std::error_code& ec);
+               std::error_code& ec,
+               std::shared_ptr<netmech::Runtime> runtime = nullptr);
 
     ~AsyncMaster();
     AsyncMaster(const AsyncMaster&) = delete;

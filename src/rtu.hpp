@@ -5,6 +5,9 @@
 // =============================================================================
 #pragma once
 
+namespace netmech { class Runtime; }
+
+
 #include "modbusmech/export.hpp"
 
 #include <condition_variable>
@@ -67,7 +70,8 @@ public:
     };
 
     static std::shared_ptr<RtuTransport>
-    create(const std::string& device, const Config& cfg, std::error_code& ec);
+    create(const std::string& device, const Config& cfg, std::error_code& ec,
+           std::shared_ptr<netmech::Runtime> runtime = nullptr);
 
     ~RtuTransport() override;
 
@@ -101,6 +105,7 @@ private:
 
     std::shared_ptr<netmech::SerialPort> m_port;
     Config                               m_cfg;
+    std::shared_ptr<netmech::Runtime>    m_runtime;   ///< 注入运行时（null=默认）
 
     std::mutex              m_mtx;
     std::condition_variable m_cv;

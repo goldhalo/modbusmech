@@ -232,7 +232,8 @@ Master::~Master() = default;
 std::shared_ptr<Master> Master::create_rtu(const std::string& device,
                                            const Config& cfg,
                                            std::uint32_t baud_rate,
-                                           std::error_code& ec)
+                                           std::error_code& ec,
+                                           std::shared_ptr<netmech::Runtime> runtime)
 {
     ec.clear();
 
@@ -251,7 +252,7 @@ std::shared_ptr<Master> Master::create_rtu(const std::string& device,
     rc.parity    = cfg.parity;
     rc.stop_bits = cfg.stop_bits;
 
-    auto tr = detail::RtuTransport::create(device, rc, ec);
+    auto tr = detail::RtuTransport::create(device, rc, ec, std::move(runtime));
     if (!tr) {
         return nullptr;
     }
@@ -266,7 +267,8 @@ std::shared_ptr<Master> Master::create_rtu(const std::string& device,
 std::shared_ptr<Master> Master::create_tcp(const std::string& host,
                                            std::uint16_t port,
                                            const Config& cfg,
-                                           std::error_code& ec)
+                                           std::error_code& ec,
+                                           std::shared_ptr<netmech::Runtime> runtime)
 {
     ec.clear();
 
@@ -275,7 +277,7 @@ std::shared_ptr<Master> Master::create_tcp(const std::string& host,
         return nullptr;
     }
 
-    auto tr = detail::TcpTransport::create(host, port, ec);
+    auto tr = detail::TcpTransport::create(host, port, ec, std::move(runtime));
     if (!tr) {
         return nullptr;
     }

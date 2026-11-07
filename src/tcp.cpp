@@ -164,13 +164,15 @@ TcpTransport::~TcpTransport()
 
 std::shared_ptr<TcpTransport> TcpTransport::create(const std::string& host,
                                                    std::uint16_t port,
-                                                   std::error_code& ec)
+                                                   std::error_code& ec,
+                                                   std::shared_ptr<netmech::Runtime> runtime)
 {
     ec.clear();
 
     auto self = std::shared_ptr<TcpTransport>(new TcpTransport());
-    self->m_host = host;
-    self->m_port = port;
+    self->m_host    = host;
+    self->m_port    = port;
+    self->m_runtime = std::move(runtime);
     if (!self->connect_once(ec)) {
         return nullptr;
     }
@@ -188,7 +190,7 @@ bool TcpTransport::connect_once(std::error_code& ec)
     }
 
     if (!m_mech) {
-        m_mech = netmech::Mechanism::create();
+        m_mech = netmech::Mechanism::create(netmech::Mechanism::Config{}, m_runtime);
         if (!m_mech) {
             ec = make_error_code(ModbusErrc::io_error);
             return false;

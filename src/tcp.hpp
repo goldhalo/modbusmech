@@ -24,6 +24,9 @@
 // =============================================================================
 #pragma once
 
+namespace netmech { class Runtime; }
+
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -57,7 +60,8 @@ class TcpTransport final : public Transport,
 public:
     /// 连接到一个 Modbus TCP 从站。
     static std::shared_ptr<TcpTransport>
-    create(const std::string& host, std::uint16_t port, std::error_code& ec);
+    create(const std::string& host, std::uint16_t port, std::error_code& ec,
+           std::shared_ptr<netmech::Runtime> runtime = nullptr);
 
     ~TcpTransport() override;
 
@@ -150,6 +154,7 @@ private:
     class Link;
 
     std::string                         m_host;
+    std::shared_ptr<netmech::Runtime> m_runtime;   ///< 注入运行时（null=默认）
     std::uint16_t                       m_port = 0;
     std::shared_ptr<netmech::Mechanism> m_mech;
     std::shared_ptr<Link>               m_link;

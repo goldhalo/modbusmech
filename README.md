@@ -368,7 +368,23 @@ cmake -S modbusmech -B build -DBUILD_SHARED_LIBS=ON -DNETMECH_LIBRARY_TYPE=SHARE
 - 进程内只有一份 netmech → 一份 io 线程池；
 - 线程数由应用在 `main` 最早期 `netmech::initialize(N)` 决定，之后所有协议库共用；
 - 退出前先 `close()` 各库对象，再 `netmech::shutdown()`。
-- 需要多套隔离池时，用 `Runtime::create(Options{io_threads=M})` 注入各库的
-  create 接口（下游库的 Runtime 透传待补）。
+- **需要多套隔离池 / 不用默认池**：modbusmech 的 `create_*` 都支持注入
+  `std::shared_ptr<netmech::Runtime>`（默认 `nullptr` = 进程级默认运行时）：
+
+  ```cpp
+  netmech::Runtime::Options o;
+  o.io_threads = 4;                      // 应用自己定
+  auto rt = netmech::Runtime::create(o);
+
+  auto slave  = modbusmech::Slave::create_tcp(1502, sc, bank, ec, rt);
+  auto master = modbusmech::Master::create_tcp("127.0.0.1", 1502, mc, ec, rt);
+  auto async  = modbusmech::AsyncMaster::create_tcp(host, port, ac, ec, rt);
+
+  // ... 使用 ...
+
+  rt->shutdown();                        // 只停这一套池
+  ```
+
+  RTU 入口（`create_rtu`）同样支持；未传 runtime 时行为与以前完全一致。
 
 实现细节与验证数据见 netmech `docs/packaging.md` 的「多库共享 netmech」一节。

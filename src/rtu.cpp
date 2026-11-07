@@ -194,7 +194,8 @@ RtuTransport::~RtuTransport()
 
 std::shared_ptr<RtuTransport> RtuTransport::create(const std::string& device,
                                                    const Config& cfg,
-                                                   std::error_code& ec)
+                                                   std::error_code& ec,
+                                                   std::shared_ptr<netmech::Runtime> runtime)
 {
     ec.clear();
 
@@ -206,7 +207,8 @@ std::shared_ptr<RtuTransport> RtuTransport::create(const std::string& device,
     }
 
     auto self = std::shared_ptr<RtuTransport>(new RtuTransport());
-    self->m_cfg = cfg;
+    self->m_cfg     = cfg;
+    self->m_runtime = std::move(runtime);
 
     netmech::SerialConfig sc;
     sc.device    = device;
@@ -214,7 +216,7 @@ std::shared_ptr<RtuTransport> RtuTransport::create(const std::string& device,
     apply_serial_params(cfg.parity, cfg.stop_bits, cfg.data_bits, sc);
 
     auto handler = std::make_shared<Handler>(self);
-    self->m_port = netmech::SerialPort::create(sc, handler, ec);
+    self->m_port = netmech::SerialPort::create(sc, handler, self->m_runtime, ec);
     if (!self->m_port) {
         return nullptr;
     }
