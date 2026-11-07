@@ -5,6 +5,8 @@
 // =============================================================================
 #pragma once
 
+#include "modbusmech/export.hpp"
+
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -118,7 +120,7 @@ private:
 ///       才能算 —— 只收到 2 字节时返回 0。调用方必须等够 3 字节再来问，
 ///       否则会把"数据还没到"当成"响应不对"。这条曾经是个真 bug
 ///       （9600bps 下读类请求随机失败）。
-[[nodiscard]] std::size_t rtu_response_body_len(const std::uint8_t* p,
+[[nodiscard]] MODBUSMECH_API std::size_t rtu_response_body_len(const std::uint8_t* p,
                                                 std::size_t         avail) noexcept;
 
 /// 按已收到的**请求**前缀推算"整帧（含地址与 CRC）有多长"。
@@ -130,17 +132,17 @@ private:
 /// @param[in] avail 已收到多少字节
 /// @return 0 表示**现在还算不出来**（数据不够）或功能码不认识 ——
 ///         这两种情况调用方都应当回退到 silence 兜底，而不是傻等。
-[[nodiscard]] std::size_t rtu_request_frame_len(const std::uint8_t* p,
+[[nodiscard]] MODBUSMECH_API std::size_t rtu_request_frame_len(const std::uint8_t* p,
                                                 std::size_t         avail) noexcept;
 
 /// 串口参数是否在值域内（data_bits 5~8；枚举值合法）。
-[[nodiscard]] bool serial_params_valid(SerialParity    parity,
+[[nodiscard]] MODBUSMECH_API bool serial_params_valid(SerialParity    parity,
                                        SerialStopBits  stop_bits,
                                        std::uint8_t    data_bits) noexcept;
 
 /// 把串口参数填进 netmech 的 SerialConfig（主站/从站共用一套映射，
 /// 免得两处 switch 各写一遍、将来加值域时改一处忘一处）。
-void apply_serial_params(SerialParity parity, SerialStopBits stop_bits,
+MODBUSMECH_API void apply_serial_params(SerialParity parity, SerialStopBits stop_bits,
                          std::uint8_t data_bits, netmech::SerialConfig& sc);
 
 } // namespace detail

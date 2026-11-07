@@ -31,6 +31,8 @@
 // =============================================================================
 #pragma once
 
+#include "modbusmech/export.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -44,7 +46,7 @@
 namespace modbusmech {
 
 /// 异步主站（TCP 客户端）。
-class AsyncMaster {
+class MODBUSMECH_API AsyncMaster {
 public:
     struct Config {
         /// 默认 unit（带 unit 参数的重载不受它影响）。

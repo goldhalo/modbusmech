@@ -17,6 +17,8 @@
 // =============================================================================
 #pragma once
 
+#include "modbusmech/export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <system_error>
@@ -35,7 +37,7 @@ namespace modbusmech {
 ///
 /// @param[in] data 数据（**不含** CRC 本身）
 /// @return CRC 值（小端写入帧尾：低字节在前）
-[[nodiscard]] std::uint16_t crc16(span<const std::uint8_t> data) noexcept;
+[[nodiscard]] MODBUSMECH_API std::uint16_t crc16(span<const std::uint8_t> data) noexcept;
 
 // =============================================================================
 //  请求 / 响应的结构
@@ -87,26 +89,26 @@ struct WriteRegistersRequest {
 /// @param[in] function 只能是 read_coils 或 read_discrete_inputs
 /// @param[out] out     PDU 字节（会被清空后重填）
 /// @return 成功返回空 error_code；数量越界返回 invalid_argument
-[[nodiscard]] std::error_code encode_pdu(Function f, const ReadBitsRequest& req,
+[[nodiscard]] MODBUSMECH_API std::error_code encode_pdu(Function f, const ReadBitsRequest& req,
                                          std::vector<std::uint8_t>& out) noexcept;
 
-[[nodiscard]] std::error_code encode_pdu(Function f, const ReadRegistersRequest& req,
+[[nodiscard]] MODBUSMECH_API std::error_code encode_pdu(Function f, const ReadRegistersRequest& req,
                                          std::vector<std::uint8_t>& out) noexcept;
 
-[[nodiscard]] std::error_code encode_pdu(Function f, const WriteCoilRequest& req,
+[[nodiscard]] MODBUSMECH_API std::error_code encode_pdu(Function f, const WriteCoilRequest& req,
                                          std::vector<std::uint8_t>& out) noexcept;
 
-[[nodiscard]] std::error_code encode_pdu(Function f, const WriteRegisterRequest& req,
+[[nodiscard]] MODBUSMECH_API std::error_code encode_pdu(Function f, const WriteRegisterRequest& req,
                                          std::vector<std::uint8_t>& out) noexcept;
 
-[[nodiscard]] std::error_code encode_pdu(Function f, const WriteCoilsRequest& req,
+[[nodiscard]] MODBUSMECH_API std::error_code encode_pdu(Function f, const WriteCoilsRequest& req,
                                          std::vector<std::uint8_t>& out) noexcept;
 
-[[nodiscard]] std::error_code encode_pdu(Function f, const WriteRegistersRequest& req,
+[[nodiscard]] MODBUSMECH_API std::error_code encode_pdu(Function f, const WriteRegistersRequest& req,
                                          std::vector<std::uint8_t>& out) noexcept;
 
 /// 编码异常响应（从站用）：功能码 | 0x80，后跟异常码。
-[[nodiscard]] std::error_code encode_exception(Function f, Exception e,
+[[nodiscard]] MODBUSMECH_API std::error_code encode_exception(Function f, Exception e,
                                                std::vector<std::uint8_t>& out) noexcept;
 
 // =============================================================================
@@ -137,7 +139,7 @@ struct DecodedPdu {
 ///
 /// @param[in] pdu 完整 PDU（第一个字节是功能码）
 /// @return 失败时 ec 说明原因（太短 / 长度不符 / 未知功能码）
-[[nodiscard]] std::error_code decode_pdu(span<const std::uint8_t> pdu,
+[[nodiscard]] MODBUSMECH_API std::error_code decode_pdu(span<const std::uint8_t> pdu,
                                          DecodedPdu& out) noexcept;
 
 // =============================================================================
@@ -154,7 +156,7 @@ struct DecodedPdu {
 /// @param[out] ex     从站返回的异常（若非 none，其余输出无意义）
 ///
 /// @return 传输/格式错误；异常码在 ex 里单独返回（不算 error_code）
-[[nodiscard]] std::error_code parse_read_response(
+[[nodiscard]] MODBUSMECH_API std::error_code parse_read_response(
     span<const std::uint8_t> pdu, Function f, std::uint16_t want,
     std::vector<bool>& bits, std::vector<std::uint16_t>& regs,
     Exception& ex) noexcept;
@@ -166,7 +168,7 @@ struct DecodedPdu {
 /// @param[in] addr 请求的起始地址
 /// @param[in] cnt  请求的数量（05/06 传 1）
 /// @param[out] ex  异常码
-[[nodiscard]] std::error_code parse_write_response(
+[[nodiscard]] MODBUSMECH_API std::error_code parse_write_response(
     span<const std::uint8_t> pdu, Function f,
     std::uint16_t addr, std::uint16_t cnt, Exception& ex) noexcept;
 

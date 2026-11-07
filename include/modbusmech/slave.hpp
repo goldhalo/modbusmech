@@ -18,6 +18,8 @@
 // =============================================================================
 #pragma once
 
+#include "modbusmech/export.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -54,7 +56,7 @@ namespace modbusmech {
 ///
 /// @note `unit == 0` 在 RTU 上表示**广播**（执行但不回应）；TCP 没有广播概念，
 ///       `unit == 0` 会当作普通地址处理。需要区分时自己判 `unit == 0`。
-class RegisterBank {
+class MODBUSMECH_API RegisterBank {
 public:
     virtual ~RegisterBank() = default;
 
@@ -125,7 +127,7 @@ public:
 };
 
 /// 从站。
-class Slave {
+class MODBUSMECH_API Slave {
 public:
     struct Config {
         /// RTU 的从站地址（1~247）。0 表示广播（不应答）。

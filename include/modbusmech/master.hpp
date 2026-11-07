@@ -31,6 +31,8 @@
 // =============================================================================
 #pragma once
 
+#include "modbusmech/export.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -49,7 +51,7 @@ class Conn;
 namespace modbusmech {
 
 /// 主站。
-class Master {
+class MODBUSMECH_API Master {
 public:
     struct Config {
         /// 单元号（RTU 的叫从站地址，TCP 的叫单元 ID）。

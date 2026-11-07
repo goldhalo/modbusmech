@@ -7,6 +7,8 @@
 // =============================================================================
 #pragma once
 
+#include "modbusmech/export.hpp"
+
 #include <cstdint>
 #include <string>
 #include <system_error>
@@ -30,7 +32,7 @@ enum class Function : std::uint8_t {
 };
 
 /// 功能码是否已知。
-[[nodiscard]] bool is_known_function(Function f) noexcept;
+[[nodiscard]] MODBUSMECH_API bool is_known_function(Function f) noexcept;
 
 // =============================================================================
 //  异常码
@@ -51,7 +53,7 @@ enum class Exception : std::uint8_t {
 };
 
 /// 异常码的可读名字（英文，便于日志检索）。
-[[nodiscard]] const char* exception_name(Exception e) noexcept;
+[[nodiscard]] MODBUSMECH_API const char* exception_name(Exception e) noexcept;
 
 // =============================================================================
 //  串口参数（RTU 用；TCP 无关）
@@ -117,7 +119,7 @@ struct Limits {
 ///
 /// 两者的重试策略不同：传输失败可以盲目重试；协议异常重试也没用（除非是
 /// `server_device_busy`）。
-struct Result {
+struct MODBUSMECH_API Result {
     std::error_code ec{};                 ///< 传输层错误（空 = 传输成功）
     Exception       exception = Exception::none;   ///< 从站返回的异常码
 
@@ -154,8 +156,8 @@ enum class ModbusErrc {
     busy,                 ///< 在途请求数已达上限（TCP 流水线配额），本次未受理
 };
 
-[[nodiscard]] const std::error_category& modbus_category() noexcept;
-[[nodiscard]] std::error_code make_error_code(ModbusErrc e) noexcept;
+[[nodiscard]] MODBUSMECH_API const std::error_category& modbus_category() noexcept;
+[[nodiscard]] MODBUSMECH_API std::error_code make_error_code(ModbusErrc e) noexcept;
 
 } // namespace modbusmech
 

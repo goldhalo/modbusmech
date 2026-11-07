@@ -74,6 +74,18 @@ file(GLOB MODBUSMECH_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/
 add_library(modbusmech ${MODBUSMECH_SOURCES})
 add_library(modbusmech::modbusmech ALIAS modbusmech)
 
+# 共享库：导出/导入宏 + hidden 可见性（只导出标了 MODBUSMECH_API 的符号）
+if(BUILD_SHARED_LIBS)
+    target_compile_definitions(modbusmech PUBLIC MODBUSMECH_SHARED)
+    target_compile_definitions(modbusmech PRIVATE MODBUSMECH_BUILDING_LIBRARY)
+    set_target_properties(modbusmech PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    if(MSVC)
+        target_compile_options(modbusmech PRIVATE /wd4251)
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # 发布成动态库（-DBUILD_SHARED_LIBS=ON）时的符号卫生
 #
