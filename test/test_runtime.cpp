@@ -31,13 +31,13 @@ namespace {
 /// 全 8 个方法的确定性 RegisterBank（读返回"地址"本身，便于断言）。
 class TestBank final : public RegisterBank {
 public:
-    bool read_coils(std::uint8_t, std::uint16_t address, std::uint16_t count,
+    bool read_coils(std::uint8_t, std::uint16_t, std::uint16_t count,
                     std::vector<bool>& out) override
     {
         out.assign(count, false);
         return true;
     }
-    bool read_discrete_inputs(std::uint8_t, std::uint16_t address,
+    bool read_discrete_inputs(std::uint8_t, std::uint16_t,
                               std::uint16_t count, std::vector<bool>& out) override
     {
         out.assign(count, false);
