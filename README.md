@@ -354,3 +354,21 @@ modbusmech 默认构建静态库；也可以构建动态库，**netmech 始终�
    io 线程运行在 `.so` 的代码里，卸载后线程再执行会崩。进程正常退出时有兜底
    （静态析构里 join 线程）。
 5. netmech 必须以 PIC 编译（`NETMECH_PIC` 默认 ON）。
+
+## 与多个协议库同进程部署（共享 netmech）
+
+modbusmech 与 httpmech / rtspmech / rtpmech 同时在一个进程里时，推荐
+**netmech 用共享库**、各协议库也用共享库并链接共享 netmech：
+
+```cmake
+# 所有库都这样配置（以 modbusmech 为例）
+cmake -S modbusmech -B build -DBUILD_SHARED_LIBS=ON -DNETMECH_LIBRARY_TYPE=SHARED
+```
+
+- 进程内只有一份 netmech → 一份 io 线程池；
+- 线程数由应用在 `main` 最早期 `netmech::initialize(N)` 决定，之后所有协议库共用；
+- 退出前先 `close()` 各库对象，再 `netmech::shutdown()`。
+- 需要多套隔离池时，用 `Runtime::create(Options{io_threads=M})` 注入各库的
+  create 接口（下游库的 Runtime 透传待补）。
+
+实现细节与验证数据见 netmech `docs/packaging.md` 的「多库共享 netmech」一节。
