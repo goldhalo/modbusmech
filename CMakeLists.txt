@@ -68,6 +68,11 @@ if(NOT EXISTS "${MODBUSMECH_NETMECH_DIR}/CMakeLists.txt")
 endif()
 set(NETMECH_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(NETMECH_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+# 动态库构建要求 netmech 也以共享库提供：否则 netmech 的 io 运行时/线程池
+# 会被静态链进本 DLL，与其它 mech 库各自的副本彼此独立（同进程多份状态）。
+if(BUILD_SHARED_LIBS)
+    set(NETMECH_LIBRARY_TYPE "SHARED" CACHE STRING "netmech 库类型" FORCE)
+endif()
 add_subdirectory("${MODBUSMECH_NETMECH_DIR}" "${CMAKE_BINARY_DIR}/netmech" EXCLUDE_FROM_ALL)
 
 file(GLOB MODBUSMECH_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
@@ -94,7 +99,8 @@ endif()
 # 既污染 ABI，也可能被同进程其它模块的符号解析"撞上"。这里把静态库符号隐藏，
 # 只导出本库自己的符号（Linux/macOS）。
 #
-# Windows 需要显式 MODBUSMECH_API 导出宏（本库尚未加；见 README「发布为动态库」）。
+# Windows 走 MODBUSMECH_API（export.hpp）：库内 dllexport、使用方 dllimport，
+# 使用方需要定义 MODBUSMECH_SHARED（CMake target 会传递）。
 # ---------------------------------------------------------------------------
 if(BUILD_SHARED_LIBS AND (UNIX AND NOT APPLE))
     target_link_options(modbusmech PRIVATE "-Wl,--exclude-libs,ALL")
