@@ -186,7 +186,7 @@ public:
         /// 这个回调同时承担鉴权和"连接建立通知"：库不再单独提供 `authorize`，
         /// 避免两个回调参数重复。使用端可以在这里维护在线客户端列表。
         ///
-        /// @param[in] id        库内递增的连接 id；断开回调带回同一个 id
+        /// @param[in] id        `netmech::Conn::id()`（稳定 uint64_t）；断开回调带回同一个 id
         /// @param[in] peer_ip   对端 IP 字面量（如 `"192.168.1.10"`，不含端口）
         /// @param[in] peer_port 对端端口
         ///
@@ -212,14 +212,16 @@ public:
         std::function<bool(std::uint64_t id, const std::string& peer_ip,
                            std::uint16_t peer_port)> on_client_connected;
 
-        /// **连接断开回调**（所有关闭路径都会触发一次：对端关闭、
-        /// `idle_timeout`、坏帧断连、`stop()` 批量关闭）。
+        /// **连接断开回调**（对端关闭、`idle_timeout`、坏帧断连、
+        /// 本端 `stop()` 等所有关闭路径都会触发）。
         ///
-        /// 在 `TcpSession` 析构里调用（唯一覆盖全部关闭路径且只走一次的出口），
-        /// 带回与 `on_client_connected` 相同的 `id` / IP / 端口。
-        /// @warning 析构默认 `noexcept`：回调抛异常会被吞掉；且在 io 线程上，
-        ///          不要阻塞，应用侧维护列表需自己加锁。
-        /// @note 与 `client_count()` 对齐：connect 时计数已 +1，本回调时即将 -1。
+        /// 在 netmech `Linkable::on_linkdown()` 里调用：库保证每个被接管的连接
+        /// **恰好一次、及时投递**（不依赖 Conn 对象析构），`on_accept` 返回空
+        /// 的拒绝连接不调用。带回与 `on_client_connected` 相同的 `id`
+        /// （`Conn::id()`）/ IP / 端口。
+        /// @warning 在 io 线程上，不要阻塞；应用侧维护列表需自己加锁。
+        /// @note 回调抛异常会被吞掉（库外层已包 try/catch）。
+        /// @note 与 `client_count()` 对齐：connect 时会话已建，本回调后计数回落。
         std::function<void(std::uint64_t id, const std::string& peer_ip,
                            std::uint16_t peer_port)> on_client_disconnected;
 

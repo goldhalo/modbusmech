@@ -98,9 +98,8 @@ public:
     ///   局部变量销毁后新连接没人接，netmech 会按"无订阅者"立即关闭。
     std::shared_ptr<netmech::Linkable>  link;
     std::atomic<std::size_t>            clients{0};
-    /// 连接 id：accept 时递增，connect / disconnect 回调带回同一个 id，
-    /// 供应用维护在线列表（库自己不保存任何连接状态）。
-    std::atomic<std::uint64_t>         next_client_id{1};
+    // 连接 id 直接用 netmech::Conn::id()（uint64_t、库保证稳定），
+    // connect / disconnect 两个回调带回同一个 id；库不额外维护任何连接状态。
 
     /// 串口事件：收到字节就追加 + 记时间。
     class SerialSink final : public netmech::SerialHandler {
@@ -348,28 +347,16 @@ public:
     class TcpSession final : public netmech::ConnHandler,
                              public std::enable_shared_from_this<TcpSession> {
     public:
-        TcpSession(std::shared_ptr<Impl> owner, std::shared_ptr<netmech::Conn> conn,
-                   std::uint64_t id, std::string peer_ip, std::uint16_t peer_port)
-            : m_owner(std::move(owner)), m_conn(std::move(conn)),
-              m_id(id), m_peer_ip(std::move(peer_ip)), m_peer_port(peer_port)
+        TcpSession(std::shared_ptr<Impl> owner, std::shared_ptr<netmech::Conn> conn)
+            : m_owner(std::move(owner)), m_conn(std::move(conn))
         {
             m_owner->clients.fetch_add(1);
         }
 
-        /// 会话析构是唯一覆盖全部关闭路径（对端关闭 / idle_timeout / 坏帧 /
-        /// stop() 批量关闭）且只走一次的出口 —— 断开通知放这里最可靠。
         ~TcpSession() override
         {
             if (m_owner) {
                 m_owner->clients.fetch_sub(1);
-                // 析构默认 noexcept + 回调跑在 io 线程：必须吞掉异常，
-                // 否则会 terminate / 让异常穿过 netmech 的回调栈。
-                try {
-                    if (m_owner->cfg.on_client_disconnected) {
-                        m_owner->cfg.on_client_disconnected(m_id, m_peer_ip, m_peer_port);
-                    }
-                } catch (...) {
-                }
             }
         }
 
@@ -542,9 +529,6 @@ public:
 
         std::shared_ptr<Impl>            m_owner;
         std::shared_ptr<netmech::Conn>   m_conn;
-        std::uint64_t                    m_id = 0;
-        std::string                      m_peer_ip;
-        std::uint16_t                    m_peer_port = 0;
         std::vector<std::uint8_t>        m_rx;
         std::array<std::uint8_t, 1024>   m_chunk{};
     };
@@ -590,10 +574,11 @@ public:
 
             // ---- 连接建立回调：接受/拒绝由使用端决定（替代旧 authorize）----
             // 返回 nullptr 就是"拒收"，netmech 会立刻关掉这条连接
-            // （不读一帧、不回应），且不会触发 on_client_disconnected。
+            // （不读一帧、不回应），且不会投递 on_linkdown。
             const auto addr = c.remote_address();
-            const std::uint64_t id =
-                owner->next_client_id.fetch_add(1, std::memory_order_relaxed);
+            // id 直接用 netmech::Conn::id()：稳定、库推荐作 map 键，
+            // on_accept 与 on_linkdown 拿到的是同一个值。
+            const std::uint64_t id = c.id();
             bool ok = true;
             if (owner->cfg.on_client_connected) {
                 try {
@@ -607,8 +592,25 @@ public:
                 return nullptr;
             }
 
-            return std::make_shared<TcpSession>(owner, c.shared_from_this(), id,
-                                                addr.address_string(), addr.port());
+            return std::make_shared<TcpSession>(owner, c.shared_from_this());
+        }
+
+        /// 连接断开：netmech 的 `Linkable::on_linkdown` 契约保证"每个被接管的
+        /// 连接恰好调用一次"（拒绝的连接不调用），在 close 流程里紧跟
+        /// `on_close()` 投递（`conn.cpp:900`），**不依赖 Conn 析构**。
+        /// 因此断开通知放这一层，而不是 TcpSession 析构。
+        void on_linkdown(netmech::Conn& c) override
+        {
+            auto owner = m_owner.lock();
+            if (!owner || !owner->cfg.on_client_disconnected) {
+                return;
+            }
+            const auto addr = c.remote_address();   // 关闭后返回缓存值，仍可用
+            try {
+                owner->cfg.on_client_disconnected(c.id(), addr.address_string(), addr.port());
+            } catch (...) {
+                // netmech 外层已包 try/catch；这里再兜一层，保证不穿回调栈。
+            }
         }
 
     private:

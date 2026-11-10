@@ -76,9 +76,10 @@ auto slave = modbusmech::Slave::create_rtu("COM3", 9600, cfg,
 Modbus 协议本身**没有**认证。库只把"谁连进来了 / 谁断开了"告诉使用端，
 **接受还是拒绝、白名单怎么判、在线列表怎么存，全由使用端决定**：
 `Config::on_client_connected` 在 accept 时回调，返回 `false` 即拒收；
-`Config::on_client_disconnected` 在会话析构时回调（覆盖对端关闭、空闲超时、
-坏帧、`stop()` 等所有关闭路径）。两个回调带回同一个库内递增的 `id`，
-应用可用它维护在线客户端列表。
+`Config::on_client_disconnected` 在 netmech `Linkable::on_linkdown()` 里回调
+（库保证每个被接管的连接恰好一次、及时投递，不依赖 Conn 析构；被拒绝的
+连接不调用）。两个回调带回同一个 `netmech::Conn::id()`，应用可用它维护
+在线客户端列表。
 
 ```cpp
 modbusmech::Slave::Config cfg;
@@ -108,7 +109,7 @@ auto slave = modbusmech::Slave::create_tcp(502, cfg, bank, ec);
   要按 unit 区分请用 `Config::addresses` / `bank_for`。
 - **回调在 io 线程上跑**，不能阻塞（查库、读文件都会拖住同时刻的其它连接）。
 - `on_client_connected` 抛异常会被吞掉并按**拒绝**处理；
-  `on_client_disconnected` 在析构里调用，异常同样被吞掉。
+  `on_client_disconnected` 在 io 线程调用，异常同样被吞掉。
 - 不设置 ⇒ 接受所有连接；被拒的连接**不会**触发 disconnected。
 - RTU 是点对点串口，这两个回调**只对 `create_tcp` 生效**。
 - `create_tcp(0, …)` 可由系统分配端口，用 `listening_port()` 读回实际端口，

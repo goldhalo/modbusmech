@@ -319,6 +319,7 @@ NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
     auto bank = std::make_shared<Bank>();
 
     std::atomic<int>         calls{0};
+    std::atomic<int>         disconnects{0};
     std::atomic<bool>        saw_loopback{false};
     Slave::Config            sc;
     sc.on_client_connected = [&](std::uint64_t /*id*/, const std::string& ip, std::uint16_t) {
@@ -327,6 +328,9 @@ NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
             saw_loopback.store(true);
         }
         return false;   // 一律拒绝
+    };
+    sc.on_client_disconnected = [&](std::uint64_t, const std::string&, std::uint16_t) {
+        disconnects.fetch_add(1);
     };
 
     std::error_code ec;
@@ -348,6 +352,7 @@ NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
     CHECK_EQ(slave->stats().rejected_clients, 1u);
     CHECK_EQ(calls.load(), 1);      // 每条连接只问一次
     CHECK(saw_loopback.load());     // 回调拿到的是对端 IP 字面量
+    CHECK_EQ(disconnects.load(), 0);  // 被拒的连接从未被接管 ⇒ 不触发 on_linkdown
 
     // 被拒之后请求必然失败（连接已被关）
     if (master) {
