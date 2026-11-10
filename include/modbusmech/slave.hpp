@@ -174,30 +174,54 @@ public:
         /// @warning 回调在该传输的 io 线程上调用，实现必须线程安全。
         std::function<std::shared_ptr<RegisterBank>(std::uint8_t)> bank_for;
 
-        /// **新 TCP 连接鉴权**（只对 `create_tcp` 生效；RTU 是点对点串口，
+        /// **连接建立回调**（只对 `create_tcp` 生效；RTU 是点对点串口，
         /// 没有"谁连进来"这个概念）。
         ///
-        /// 每条连接被 accept 时调用一次：
+        /// 每条连接被 accept 时调用一次，**由使用端决定是否接受**：
         ///  - 返回 `true`  ⇒ 正常建立会话；
         ///  - 返回 `false` ⇒ 库**立刻关掉**这条连接（不读一帧、不回应），
-        ///                   并计入 `stats().rejected_clients`。
+        ///                   计入 `stats().rejected_clients`，
+        ///                   **不会**触发 `on_client_disconnected`。
         ///
+        /// 这个回调同时承担鉴权和"连接建立通知"：库不再单独提供 `authorize`，
+        /// 避免两个回调参数重复。使用端可以在这里维护在线客户端列表。
+        ///
+        /// @param[in] id        库内递增的连接 id；断开回调带回同一个 id
         /// @param[in] peer_ip   对端 IP 字面量（如 `"192.168.1.10"`，不含端口）
         /// @param[in] peer_port 对端端口
         ///
-        /// @par 典型用法：白名单
+        /// @par 典型用法：白名单 + 在线列表
         /// @code
-        ///     sc.authorize = [](const std::string& ip, std::uint16_t) {
-        ///         return ip == "192.168.1.10" || ip == "192.168.1.11";
+        ///     sc.on_client_connected = [&](std::uint64_t id,
+        ///                                  const std::string& ip, std::uint16_t port) {
+        ///         if (ip != "192.168.1.10") return false;   // 拒绝
+        ///         { std::lock_guard<std::mutex> lk(mu); clients[id] = {ip, port}; }
+        ///         return true;
+        ///     };
+        ///     sc.on_client_disconnected = [&](std::uint64_t id,
+        ///                                     const std::string&, std::uint16_t) {
+        ///         std::lock_guard<std::mutex> lk(mu); clients.erase(id);
         ///     };
         /// @endcode
         ///
         /// @warning 在该连接的 **io 线程**上调用，**不要阻塞**（查库、读文件都会
-        ///          拖住同时刻的其它连接）。要查的东西请提前准备好，回调里只做比较。
+        ///          拖住同时刻的其它连接）。应用侧列表要自己加锁。
         /// @warning 回调里抛出的异常会被吞掉并按"拒绝"处理 —— 不让异常穿过
         ///          netmech 的回调栈。
         /// @note 不设置 ⇒ 接受所有连接（与改造前行为一致）。
-        std::function<bool(const std::string& peer_ip, std::uint16_t peer_port)> authorize;
+        std::function<bool(std::uint64_t id, const std::string& peer_ip,
+                           std::uint16_t peer_port)> on_client_connected;
+
+        /// **连接断开回调**（所有关闭路径都会触发一次：对端关闭、
+        /// `idle_timeout`、坏帧断连、`stop()` 批量关闭）。
+        ///
+        /// 在 `TcpSession` 析构里调用（唯一覆盖全部关闭路径且只走一次的出口），
+        /// 带回与 `on_client_connected` 相同的 `id` / IP / 端口。
+        /// @warning 析构默认 `noexcept`：回调抛异常会被吞掉；且在 io 线程上，
+        ///          不要阻塞，应用侧维护列表需自己加锁。
+        /// @note 与 `client_count()` 对齐：connect 时计数已 +1，本回调时即将 -1。
+        std::function<void(std::uint64_t id, const std::string& peer_ip,
+                           std::uint16_t peer_port)> on_client_disconnected;
 
         /// 本实例是否应答该 unit。
         ///
@@ -256,7 +280,7 @@ public:
         /// 同时允许的客户端上限。0 = 不限制（默认，与改造前一致）。
         ///
         /// 超限的新连接在 accept 阶段直接拒绝（计入 `stats().rejected_clients`），
-        /// 不读一帧、不回应 —— 与 `authorize` 拒绝的路径相同。
+        /// 不读一帧、不回应 —— 与 `on_client_connected` 返回 false 的路径相同。
         ///
         /// @note 计数是"当前会话数"，不是"历史连接数"；客户端断开后名额立刻释放。
         std::size_t max_clients = 0;
@@ -271,11 +295,13 @@ public:
 
     /// TCP 从站（服务端，**支持多个客户端**）。
     ///
-    /// @param[in] port 监听端口（Modbus TCP 默认 502）
+    /// @param[in] port 监听端口（Modbus TCP 默认 502）；**传 0 由系统分配**，
+    ///                 建好后用 `listening_port()` 读回实际端口。
     ///
     /// @note 每个客户端是独立的会话，但共享同一个 `bank`。应用要保证 bank
     ///       线程安全（或者接受并发读写的语义）。
     /// @note 这个重载固定监听 `0.0.0.0`；需要绑定指定网卡/地址用下面那个重载。
+    ///       port=0 不经过"先探测空闲端口再 bind"的窗口，可根除 TOCTOU 竞态。
     [[nodiscard]] static std::shared_ptr<Slave>
     create_tcp(std::uint16_t port, const Config& cfg,
                std::shared_ptr<RegisterBank> bank, std::error_code& ec,
@@ -303,11 +329,16 @@ public:
     /// 当前 TCP 客户端数（RTU 恒为 0 或 1）。
     [[nodiscard]] std::size_t client_count() const noexcept;
 
+    /// 实际监听端口。`create_tcp(0, …)` 由系统分配端口后用本方法读回；
+    /// 未监听 / 未启动返回 0。
+    /// @note 线程安全；只读 netmech 监听器表里已登记的**实际**绑定地址。
+    [[nodiscard]] std::uint16_t listening_port() const noexcept;
+
     struct Stats {
         std::uint64_t requests   = 0;
         std::uint64_t exceptions = 0;   ///< 回出去异常的次数
         std::uint64_t bad_frames = 0;   ///< CRC/长度错的帧（直接丢弃）
-        std::uint64_t rejected_clients = 0;   ///< 被 `authorize` / `max_clients` 拒绝的连接数
+        std::uint64_t rejected_clients = 0;   ///< 被 `on_client_connected` / `max_clients` 拒绝的连接数
         std::uint64_t send_failures = 0;      ///< 响应没写出去（连接已断 / 写队列满）
     };
     [[nodiscard]] Stats stats() const noexcept;

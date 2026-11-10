@@ -83,14 +83,14 @@ NETMECH_TEST(modbusmech_uses_injected_runtime)
     CHECK_EQ(rt->io_threads(), std::size_t{1});
     CHECK(rt->running());
 
-    const auto port_opt = netmech::find_free_port_run(46000, 47000, 1, 1);
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配
 
     auto bank = std::make_shared<TestBank>();
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, {}, bank, ec, rt);
+    auto slave = Slave::create_tcp(0, {}, bank, ec, rt);
     REQUIRE(slave != nullptr);
+    port = slave->listening_port();
+    REQUIRE(port != 0u);
     CHECK(!ec);
 
     Master::Config mc;
@@ -126,14 +126,14 @@ NETMECH_TEST(async_master_uses_injected_runtime)
     auto rt = netmech::Runtime::create(opt);
     REQUIRE(rt != nullptr);
 
-    const auto port_opt = netmech::find_free_port_run(46000, 47000, 1, 1);
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配
 
     auto bank = std::make_shared<TestBank>();
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, {}, bank, ec, rt);
+    auto slave = Slave::create_tcp(0, {}, bank, ec, rt);
     REQUIRE(slave != nullptr);
+    port = slave->listening_port();
+    REQUIRE(port != 0u);
 
     AsyncMaster::Config ac;
     auto async = AsyncMaster::create_tcp("127.0.0.1", port, ac, ec, rt);

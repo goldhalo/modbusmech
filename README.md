@@ -71,24 +71,35 @@ auto slave = modbusmech::Slave::create_rtu("COM3", 9600, cfg,
                                            std::make_shared<MyBank>(), ec);
 ```
 
-#### TCP 从站：新连接鉴权
+#### TCP 从站：连接事件回调
 
-Modbus 协议本身**没有**认证。要在"谁能连进来"这一层做控制，用
-`Config::authorize` —— 每条 TCP 连接被 accept 时回调一次：
+Modbus 协议本身**没有**认证。库只把"谁连进来了 / 谁断开了"告诉使用端，
+**接受还是拒绝、白名单怎么判、在线列表怎么存，全由使用端决定**：
+`Config::on_client_connected` 在 accept 时回调，返回 `false` 即拒收；
+`Config::on_client_disconnected` 在会话析构时回调（覆盖对端关闭、空闲超时、
+坏帧、`stop()` 等所有关闭路径）。两个回调带回同一个库内递增的 `id`，
+应用可用它维护在线客户端列表。
 
 ```cpp
 modbusmech::Slave::Config cfg;
 cfg.address = 1;
 
-// 白名单：不在名单里的连接直接被关掉（不读一帧、不回应）
-cfg.authorize = [](const std::string& peer_ip, std::uint16_t /*peer_port*/) {
-    return peer_ip == "192.168.1.10" || peer_ip == "192.168.1.11";
+// 白名单 + 在线列表（回调在 io 线程，应用自己加锁）
+cfg.on_client_connected = [&](std::uint64_t id,
+                              const std::string& ip, std::uint16_t port) {
+    if (ip != "192.168.1.10" && ip != "192.168.1.11") return false;
+    std::lock_guard<std::mutex> lk(mu);
+    clients[id] = {ip, port};
+    return true;
+};
+cfg.on_client_disconnected = [&](std::uint64_t id,
+                                 const std::string&, std::uint16_t) {
+    std::lock_guard<std::mutex> lk(mu);
+    clients.erase(id);
 };
 
 auto slave = modbusmech::Slave::create_tcp(502, cfg, bank, ec);
-
-// 被拒了多少条，看统计：
-//   slave->stats().rejected_clients
+// 被拒了多少条，看统计：slave->stats().rejected_clients
 ```
 
 几点注意：
@@ -96,10 +107,12 @@ auto slave = modbusmech::Slave::create_tcp(502, cfg, bank, ec);
 - **只看 IP/端口**：accept 时还没收到任何 Modbus 帧，所以拿不到 unit id；
   要按 unit 区分请用 `Config::addresses` / `bank_for`。
 - **回调在 io 线程上跑**，不能阻塞（查库、读文件都会拖住同时刻的其它连接）。
-  需要查的东西提前准备好，回调里只做比较。
-- 回调抛异常会被吞掉并按**拒绝**处理 —— 不让异常穿过 netmech 的回调栈。
-- 不设置 ⇒ 接受所有连接（与旧行为一致）。
-- RTU 是点对点串口，没有"谁连进来"的概念，这个回调**只对 `create_tcp` 生效**。
+- `on_client_connected` 抛异常会被吞掉并按**拒绝**处理；
+  `on_client_disconnected` 在析构里调用，异常同样被吞掉。
+- 不设置 ⇒ 接受所有连接；被拒的连接**不会**触发 disconnected。
+- RTU 是点对点串口，这两个回调**只对 `create_tcp` 生效**。
+- `create_tcp(0, …)` 可由系统分配端口，用 `listening_port()` 读回实际端口，
+  避免"先探测空闲端口再 bind"的 TOCTOU 竞态（测试 / CI 推荐）。
 
 ---
 

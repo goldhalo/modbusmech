@@ -14,6 +14,7 @@
 #include <netmech/net.hpp>
 
 #include <cstring>
+#include <cstdio>
 #include <array>
 #include <condition_variable>
 #include <mutex>
@@ -42,6 +43,31 @@ inline std::optional<std::uint16_t> next_free_test_port()
     const std::uint16_t base =
         static_cast<std::uint16_t>(40000 + (n.fetch_add(1) * 8) % 800);
     return netmech::find_free_port_run(base, 50000, 1, 1);
+}
+
+/// 用 port=0 让内核分配监听端口，彻底避开 find_free_port_run 的 TOCTOU 窗口。
+/// 成功后把实际端口写回 port_out，供 Master 连接；失败时把 ec 打出来。
+inline std::shared_ptr<Slave> make_test_slave(const Slave::Config& cfg,
+                                              std::shared_ptr<RegisterBank> bank,
+                                              std::error_code& ec,
+                                              std::uint16_t& port_out)
+{
+    auto s = Slave::create_tcp(0, cfg, std::move(bank), ec);
+    if (!s) {
+        std::fputs("[test] create_tcp(0) failed: ", stderr);
+        std::fputs(ec.message().c_str(), stderr);
+        std::fputc(10, stderr);
+        port_out = 0;
+        return nullptr;
+    }
+    port_out = s->listening_port();
+    if (port_out == 0) {
+        std::fputs("[test] listening_port() == 0", stderr);
+        std::fputc(10, stderr);
+        ec = std::make_error_code(std::errc::address_not_available);
+        return nullptr;
+    }
+    return s;
 }
 
 using namespace std::chrono_literals;
@@ -103,14 +129,12 @@ private:
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_read_holding_registers)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>();
     Slave::Config sc;
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
     CHECK(slave->is_running());
 
@@ -140,14 +164,12 @@ NETMECH_TEST(tcp_master_read_holding_registers)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_transaction_ids_increment)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>();
     Slave::Config sc;
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -174,14 +196,12 @@ NETMECH_TEST(tcp_transaction_ids_increment)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_write_single_register)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>();
     Slave::Config sc;
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -210,14 +230,12 @@ NETMECH_TEST(tcp_write_single_register)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_exception_illegal_address)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>();
     Slave::Config sc;
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -244,14 +262,12 @@ NETMECH_TEST(tcp_exception_illegal_address)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_multiple_clients)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>();
     Slave::Config sc;
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     constexpr int kClients = 3;
@@ -294,20 +310,18 @@ NETMECH_TEST(tcp_multiple_clients)
 }
 
 // ---------------------------------------------------------------------------
-// 鉴权：authorize 返回 false ⇒ 连接被立刻关掉，且计入 rejected_clients
+// 连接建立回调：on_client_connected 返回 false ⇒ 连接被立刻关掉，且计入 rejected_clients
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>();
 
     std::atomic<int>         calls{0};
     std::atomic<bool>        saw_loopback{false};
     Slave::Config            sc;
-    sc.authorize = [&](const std::string& ip, std::uint16_t) {
+    sc.on_client_connected = [&](std::uint64_t /*id*/, const std::string& ip, std::uint16_t) {
         calls.fetch_add(1);
         if (ip == "127.0.0.1") {
             saw_loopback.store(true);
@@ -316,7 +330,7 @@ NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
     };
 
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -347,27 +361,77 @@ NETMECH_TEST(tcp_slave_authorize_rejects_unknown_peer)
 }
 
 // ---------------------------------------------------------------------------
-// 鉴权：authorize 返回 true ⇒ 正常服务（顺带验证回调拿到的 IP 正确）
+// 连接事件回调：connected / disconnected 成对触发，id 一致，覆盖对端关闭
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tcp_slave_client_connected_disconnected_events)
+{
+    std::uint16_t port = 0;
+    auto bank = std::make_shared<Bank>(10);
+
+    std::mutex mu;
+    std::vector<std::uint64_t> connected, disconnected;
+    std::atomic<bool> saw_loopback{false};
+
+    Slave::Config sc;
+    sc.on_client_connected = [&](std::uint64_t id, const std::string& ip, std::uint16_t) {
+        if (ip == "127.0.0.1") saw_loopback.store(true);
+        std::lock_guard<std::mutex> lk(mu);
+        connected.push_back(id);
+        return true;
+    };
+    sc.on_client_disconnected = [&](std::uint64_t id, const std::string&, std::uint16_t) {
+        std::lock_guard<std::mutex> lk(mu);
+        disconnected.push_back(id);
+    };
+
+    std::error_code ec;
+    auto slave = make_test_slave(sc, bank, ec, port);
+    REQUIRE(slave != nullptr);
+
+    Master::Config mc;
+    mc.timeout = 1000ms;
+    mc.retries = 0;
+    auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+    REQUIRE(master != nullptr);
+
+    for (int i = 0; i < 100; ++i) {
+        { std::lock_guard<std::mutex> lk(mu); if (!connected.empty()) break; }
+        std::this_thread::sleep_for(10ms);
+    }
+    { std::lock_guard<std::mutex> lk(mu); REQUIRE(connected.size() == 1u); }
+    CHECK(saw_loopback.load());
+
+    master->close();
+    slave->stop();
+    for (int i = 0; i < 200; ++i) {
+        { std::lock_guard<std::mutex> lk(mu); if (!disconnected.empty()) break; }
+        std::this_thread::sleep_for(10ms);
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    REQUIRE(disconnected.size() == 1u);
+    CHECK_EQ(disconnected[0], connected[0]);
+}
+
+// ---------------------------------------------------------------------------
+// 连接建立回调：on_client_connected 返回 true ⇒ 正常服务（顺带验证回调拿到的 IP 正确）
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_authorize_allows_known_peer)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>();
 
     std::atomic<int>  calls{0};
     std::atomic<bool> saw_loopback{false};
     Slave::Config     sc;
-    sc.authorize = [&](const std::string& ip, std::uint16_t) {
+    sc.on_client_connected = [&](std::uint64_t /*id*/, const std::string& ip, std::uint16_t) {
         calls.fetch_add(1);
         saw_loopback.store(ip == "127.0.0.1");
         return true;
     };
 
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -402,9 +466,7 @@ NETMECH_TEST(tcp_slave_authorize_allows_known_peer)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_uses_configured_unit)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>();
 
@@ -417,7 +479,7 @@ NETMECH_TEST(tcp_master_uses_configured_unit)
         return unit == 7 ? bank : nullptr;
     };
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     // 主站 unit = 7：能通
@@ -457,9 +519,7 @@ NETMECH_TEST(tcp_master_uses_configured_unit)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_serves_multiple_units_on_one_connection)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     // 两台"设备"：unit=1 的值是 10x，unit=2 的值是 20x
     auto bank1 = std::make_shared<Bank>(10);   // 值 = i * 10
@@ -477,7 +537,7 @@ NETMECH_TEST(tcp_master_serves_multiple_units_on_one_connection)
     };
 
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank1, ec);
+    auto slave = make_test_slave(sc, bank1, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -520,9 +580,7 @@ NETMECH_TEST(tcp_master_serves_multiple_units_on_one_connection)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_concurrent_polling_with_app_side_lock)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank1 = std::make_shared<Bank>(10);
     auto bank2 = std::make_shared<Bank>(20);
@@ -533,7 +591,7 @@ NETMECH_TEST(tcp_master_concurrent_polling_with_app_side_lock)
     };
 
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank1, ec);
+    auto slave = make_test_slave(sc, bank1, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -771,9 +829,7 @@ NETMECH_TEST(tcp_master_reconnect_disabled_reports_error)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_idle_timeout_closes_idle_connection)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>(10);
 
@@ -781,7 +837,7 @@ NETMECH_TEST(tcp_slave_idle_timeout_closes_idle_connection)
     sc.idle_timeout = 100ms;
 
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -817,9 +873,7 @@ NETMECH_TEST(tcp_slave_idle_timeout_closes_idle_connection)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_max_clients_rejects_extra)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>(10);
 
@@ -827,7 +881,7 @@ NETMECH_TEST(tcp_slave_max_clients_rejects_extra)
     sc.max_clients = 1;
 
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -862,15 +916,13 @@ NETMECH_TEST(tcp_slave_max_clients_rejects_extra)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_pipeline_allows_concurrent_requests)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>(10);
 
     Slave::Config sc;
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -919,9 +971,7 @@ NETMECH_TEST(tcp_master_pipeline_allows_concurrent_requests)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_slave_address_filter_drops_other_units)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>(10);
 
@@ -929,7 +979,7 @@ NETMECH_TEST(tcp_slave_address_filter_drops_other_units)
     sc.addresses = {1};        // 只应答 unit 1
 
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     Master::Config mc;
@@ -1048,15 +1098,13 @@ struct AsyncProbe {
 // ---------------------------------------------------------------------------
 NETMECH_TEST(async_master_read_holding_registers)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
+    std::uint16_t port = 0;   // port=0 由内核分配，make_test_slave 回写实际端口
 
     auto bank = std::make_shared<Bank>(10);
 
     Slave::Config sc;
     std::error_code ec;
-    auto slave = Slave::create_tcp(port, sc, bank, ec);
+    auto slave = make_test_slave(sc, bank, ec, port);
     REQUIRE(slave != nullptr);
 
     AsyncMaster::Config ac;

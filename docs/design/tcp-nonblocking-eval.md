@@ -112,7 +112,7 @@ async->read_holding_registers(unit, addr, cnt, [](Result r, std::vector<std::uin
 - 收益：零阻塞线程、天然流水线、与 netmech 的事件模型一致；可以做到"单线程管上千连接"。
 - 代价/风险：
   - API 面积翻倍（8 个功能码 × 2 种风格）；建议只提供回调式 + 一个通用 `request()`，不铺满。
-  - 回调在 io 线程 → 用户回调里不能阻塞（与 `Slave` 的 `authorize` 同一条约束）。
+  - 回调在 io 线程 → 用户回调里不能阻塞（与 `Slave` 的 `on_client_connected` 同一条约束）。
   - buffer 生命周期（响应缓冲由库持有到回调返回，用 `Buf::owner` 语义）。
   - 用户的采集逻辑要从"顺序写代码"改成"状态机/回调"，迁移成本真实存在。
 - 工作量：新增 `async_master.hpp/.cpp` 约 500~600 行 + 测试；3~5 人日。
@@ -199,7 +199,7 @@ netmech on_read(io 线程)
 |---|---|---|---|---|
 | 1 | **bank 回调在 io 线程同步执行** | 是 | netmech 是 N 个 io_context / 每 context 1 线程，多个会话**共享**同一线程。一个慢 bank（访问真实设备、查库）会卡住同线程上的**其它客户端** | 先文档约束「bank 回调要快（<1ms 量级）」；确有慢操作再考虑卸载到 `netmech::WorkerPool`——但那会打乱响应顺序（Modbus TCP 允许按 tid 乱序，现场客户端未必接受） |
 | 2 | **没有空闲超时** | 无 | 客户端连上不发数据就永久占一个 session（1KB 缓冲 + handler）；长期运行会积累半开连接 | 加 `Config::idle_timeout`（用 netmech 的 Timer，在某条连接 N 秒无请求时断开） |
-| 3 | **没有最大连接数** | 无 | 异常/恶意客户端可把 fd 与内存吃光 | 加 `Config::max_clients`：accept 时超限直接拒（复用 `authorize` 的拒绝路径） |
+| 3 | **没有最大连接数** | 无 | 异常/恶意客户端可把 fd 与内存吃光 | 加 `Config::max_clients`：accept 时超限直接拒（复用 `on_client_connected` 的拒绝路径） |
 | 4 | **响应写回背压** | `write_conn` 忽略 `Conn::write` 返回值 | netmech 写队列满（默认 2MB/256 笔）时响应**静默丢弃**，客户端只会超时 | 写失败 → 断开该连接（对端立刻能重连重来），并计入统计 |
 | 5 | **半帧 + 断开** | 随 session 一起丢弃 | 无 | 不需要改（新连接 = 新 session = 空 m_rx，正确） |
 | 6 | **多会话共享 bank** | 文档要求应用加锁 | 数据竞争由应用负责（与设计文档一致） | 不需要改；可考虑提供一个加锁包装器 |

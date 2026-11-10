@@ -98,6 +98,9 @@ public:
     ///   局部变量销毁后新连接没人接，netmech 会按"无订阅者"立即关闭。
     std::shared_ptr<netmech::Linkable>  link;
     std::atomic<std::size_t>            clients{0};
+    /// 连接 id：accept 时递增，connect / disconnect 回调带回同一个 id，
+    /// 供应用维护在线列表（库自己不保存任何连接状态）。
+    std::atomic<std::uint64_t>         next_client_id{1};
 
     /// 串口事件：收到字节就追加 + 记时间。
     class SerialSink final : public netmech::SerialHandler {
@@ -345,17 +348,28 @@ public:
     class TcpSession final : public netmech::ConnHandler,
                              public std::enable_shared_from_this<TcpSession> {
     public:
-        TcpSession(std::shared_ptr<Impl> owner, std::shared_ptr<netmech::Conn> conn)
-            : m_owner(std::move(owner)), m_conn(std::move(conn))
+        TcpSession(std::shared_ptr<Impl> owner, std::shared_ptr<netmech::Conn> conn,
+                   std::uint64_t id, std::string peer_ip, std::uint16_t peer_port)
+            : m_owner(std::move(owner)), m_conn(std::move(conn)),
+              m_id(id), m_peer_ip(std::move(peer_ip)), m_peer_port(peer_port)
         {
             m_owner->clients.fetch_add(1);
         }
 
+        /// 会话析构是唯一覆盖全部关闭路径（对端关闭 / idle_timeout / 坏帧 /
+        /// stop() 批量关闭）且只走一次的出口 —— 断开通知放这里最可靠。
         ~TcpSession() override
         {
-            
             if (m_owner) {
                 m_owner->clients.fetch_sub(1);
+                // 析构默认 noexcept + 回调跑在 io 线程：必须吞掉异常，
+                // 否则会 terminate / 让异常穿过 netmech 的回调栈。
+                try {
+                    if (m_owner->cfg.on_client_disconnected) {
+                        m_owner->cfg.on_client_disconnected(m_id, m_peer_ip, m_peer_port);
+                    }
+                } catch (...) {
+                }
             }
         }
 
@@ -528,6 +542,9 @@ public:
 
         std::shared_ptr<Impl>            m_owner;
         std::shared_ptr<netmech::Conn>   m_conn;
+        std::uint64_t                    m_id = 0;
+        std::string                      m_peer_ip;
+        std::uint16_t                    m_peer_port = 0;
         std::vector<std::uint8_t>        m_rx;
         std::array<std::uint8_t, 1024>   m_chunk{};
     };
@@ -563,33 +580,35 @@ public:
             }
 
             // ---- 连接数上限：超了直接拒 ----
-            // 与 authorize 拒绝走同一条路径（不读一帧、不回应）。accept 由监听器
-            // 串行驱动，所以这里"读计数 → 建会话"之间不会有并发 accept 插进来。
+            // 与 on_client_connected 拒绝走同一条路径（不读一帧、不回应）。
+            // accept 由监听器串行驱动，所以"读计数 → 建会话"之间不会有并发 insert。
             if (owner->cfg.max_clients != 0
                 && owner->clients.load(std::memory_order_relaxed) >= owner->cfg.max_clients) {
                 owner->stats.rejected_clients.fetch_add(1, std::memory_order_relaxed);
                 return nullptr;
             }
 
-            // ---- 鉴权：每条新连接问一次应用 ----
+            // ---- 连接建立回调：接受/拒绝由使用端决定（替代旧 authorize）----
             // 返回 nullptr 就是"拒收"，netmech 会立刻关掉这条连接
-            // （不读一帧、不回应，对端只看到连接被关）。
-            if (owner->cfg.authorize) {
-                const auto addr = c.remote_address();
-                bool       ok   = false;
+            // （不读一帧、不回应），且不会触发 on_client_disconnected。
+            const auto addr = c.remote_address();
+            const std::uint64_t id =
+                owner->next_client_id.fetch_add(1, std::memory_order_relaxed);
+            bool ok = true;
+            if (owner->cfg.on_client_connected) {
                 try {
-                    ok = owner->cfg.authorize(addr.address_string(), addr.port());
+                    ok = owner->cfg.on_client_connected(id, addr.address_string(), addr.port());
                 } catch (...) {
                     ok = false;   // 回调抛异常 ⇒ 按拒绝处理，绝不穿过 netmech 的回调栈
                 }
-                if (!ok) {
-                    // 与其它计数器保持一致的写法（on_accept 由监听器串行驱动）
-                    owner->stats.rejected_clients.fetch_add(1, std::memory_order_relaxed);
-                    return nullptr;
-                }
+            }
+            if (!ok) {
+                owner->stats.rejected_clients.fetch_add(1, std::memory_order_relaxed);
+                return nullptr;
             }
 
-            return std::make_shared<TcpSession>(owner, c.shared_from_this());
+            return std::make_shared<TcpSession>(owner, c.shared_from_this(), id,
+                                                addr.address_string(), addr.port());
         }
 
     private:
@@ -975,6 +994,21 @@ std::size_t Slave::client_count() const noexcept
         return m_impl->clients.load();
     }
     return (m_impl->port && m_impl->port->is_open()) ? 1u : 0u;
+}
+
+std::uint16_t Slave::listening_port() const noexcept
+{
+    if (!m_impl || !m_impl->mech) {
+        return 0;
+    }
+    try {
+        // create_tcp(0, …) 时由系统分配端口；读的是**实际绑定地址**，
+        // 不是入参里的 0。多监听时取第一个（测试场景只有一个）。
+        const auto addrs = m_impl->mech->listening_addresses();
+        return addrs.empty() ? std::uint16_t{0} : addrs.front().port();
+    } catch (...) {
+        return 0;
+    }
 }
 
 Slave::Stats Slave::stats() const noexcept
