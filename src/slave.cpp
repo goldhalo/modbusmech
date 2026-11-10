@@ -45,7 +45,29 @@ namespace {
 
 using namespace std::chrono_literals;
 
+/// 每个请求、每个 io 线程的"待回异常码"槽。
+///
+/// 为什么是 thread_local：TCP 下 bank 被多个会话共享，回调跑在不同 io 线程；
+/// 用普通成员会让"A 连接设的 03"被"B 连接的 02"读到（串码）。库在每个请求
+/// 的 `handle_pdu` 入口复位它，应用只在失败前用 `set_exception()` 写入。
+thread_local Exception g_pending_exception = Exception::none;
+
 } // namespace
+
+void RegisterBank::set_exception(Exception e) const noexcept
+{
+    g_pending_exception = e;
+}
+
+void RegisterBank::clear_exception() const noexcept
+{
+    g_pending_exception = Exception::none;
+}
+
+Exception RegisterBank::last_exception() const
+{
+    return g_pending_exception;
+}
 
 // =============================================================================
 //  Impl
@@ -601,6 +623,10 @@ bool Slave::Impl::handle_pdu(std::uint8_t unit, RegisterBank& b,
 {
     resp.clear();
 
+    // ★ 每个请求开始先复位异常槽：上一次失败设置的 03/04 不能污染这一帧。
+    //   覆盖 last_exception() 的旧实现仍由应用自己管理状态（见 slave.hpp 注释）。
+    b.clear_exception();
+
     // ★ 未知功能码必须回 01（illegal_function），不能静默丢弃。
     //   以前这里直接交给 decode_pdu：它对不认识的功能码返回 invalid_argument，
     //   handle_pdu 就把它当"畸形帧"丢了 —— 主站只能等到超时，无法区分
@@ -883,6 +909,18 @@ std::shared_ptr<Slave> Slave::create_tcp(std::uint16_t port,
                                          std::error_code& ec,
                                          std::shared_ptr<netmech::Runtime> runtime)
 {
+    // 原签名保持源码兼容：旧实现硬编码 0.0.0.0，现在统一转发到可指定 host 的重载。
+    return Slave::create_tcp(std::string{}, port, cfg, std::move(bank), ec,
+                             std::move(runtime));
+}
+
+std::shared_ptr<Slave> Slave::create_tcp(const std::string& host,
+                                         std::uint16_t port,
+                                         const Config& cfg,
+                                         std::shared_ptr<RegisterBank> bank,
+                                         std::error_code& ec,
+                                         std::shared_ptr<netmech::Runtime> runtime)
+{
     ec.clear();
 
     // 同 create_rtu：bank 与 bank_for 至少给一个（TCP 多 unit 时常用 bank_for）
@@ -904,7 +942,8 @@ std::shared_ptr<Slave> Slave::create_tcp(std::uint16_t port,
 
     auto link = std::make_shared<Impl::Link>(impl);
     impl->link = link;                    // ★ 存住（见成员注释）
-    const netmech::Address addr{"0.0.0.0", port};
+    // 空 host 回退到"监听所有网卡"，与旧行为逐字一致。
+    const netmech::Address addr{host.empty() ? "0.0.0.0" : host, port};
     impl->mech->set_linkable(link);
     ec = impl->mech->listen(addr, link);
     if (ec) {

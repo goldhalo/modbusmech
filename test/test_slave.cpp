@@ -449,59 +449,35 @@ private:
     std::uint16_t m_v;
 };
 
-/// 读输入寄存器 = "没有新事件" ⇒ 用 last_exception 明确要求回 03。
+/// 读输入寄存器 = "没有新事件" ⇒ 用 set_exception 明确要求回 03。
 /// 其余区域照样失败，但**不指定码** ⇒ 应回默认的 02。
 ///
-/// ★ 每个方法开头都复位 m_exc —— 这是 last_exception 的正确用法，库不会代劳。
+/// ★ 故意不覆盖 last_exception()、不在每个方法开头复位、也不实现
+///   write_multiple_*：这三条都由库兜底 ——
+///   ① 异常槽每请求自动复位；② 不指定码回 02；③ FC15/16 默认拒绝回 01。
+///   本类是这三条契约的回归夹具。
 class EmptyEventQueueBank final : public RegisterBank {
 public:
     bool read_input_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t,
                               std::vector<std::uint16_t>&) override
     {
-        m_exc = Exception::illegal_data_value;   // 01 84 03
+        set_exception(Exception::illegal_data_value);   // 01 84 03
         return false;
     }
-    Exception last_exception() const override { return m_exc; }
 
     bool read_coils(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t, std::vector<bool>&) override
-    {
-        m_exc = Exception::none;
-        return false;
-    }
-    bool read_discrete_inputs(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t, std::vector<bool>&) override
-    {
-        m_exc = Exception::none;
-        return false;
-    }
+    { return false; }
+    bool read_discrete_inputs(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t,
+                              std::vector<bool>&) override
+    { return false; }
     bool read_holding_registers(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t,
                                 std::vector<std::uint16_t>&) override
-    {
-        m_exc = Exception::none;
-        return false;
-    }
+    { return false; }
     bool write_single_coil(std::uint8_t /*unit*/, std::uint16_t, bool) override
-    {
-        m_exc = Exception::none;
-        return false;
-    }
+    { return false; }
     bool write_single_register(std::uint8_t /*unit*/, std::uint16_t, std::uint16_t) override
-    {
-        m_exc = Exception::none;
-        return false;
-    }
-    bool write_multiple_coils(std::uint8_t /*unit*/, std::uint16_t, const std::vector<bool>&) override
-    {
-        m_exc = Exception::none;
-        return false;
-    }
-    bool write_multiple_registers(std::uint8_t /*unit*/, std::uint16_t, const std::vector<std::uint16_t>&) override
-    {
-        m_exc = Exception::none;
-        return false;
-    }
-
-private:
-    mutable Exception m_exc = Exception::none;
+    { return false; }
+    // write_multiple_coils / write_multiple_registers 走库默认拒绝实现
 };
 
 /// 读保持寄存器时**直接抛异常**（应用实现里很常见的写法：内部校验失败、
@@ -770,6 +746,17 @@ NETMECH_TEST(slave_custom_exception_code)
     REQUIRE(r2.size() >= 5u);
     CHECK_EQ(r2[1], 0x83);
     CHECK_EQ(r2[2], 0x02);
+
+    // ③ FC16 / FC15 未实现 ⇒ 库默认拒绝，回 01（不穿透到 bank 的写回调）
+    const auto r3 = slave_exchange(pty, {0x01, 0x10, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x0A}, 5);
+    REQUIRE(r3.size() >= 5u);
+    CHECK_EQ(r3[1], 0x90);
+    CHECK_EQ(r3[2], 0x01);
+
+    const auto r4 = slave_exchange(pty, {0x01, 0x0F, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01}, 5);
+    REQUIRE(r4.size() >= 5u);
+    CHECK_EQ(r4[1], 0x8F);
+    CHECK_EQ(r4[2], 0x01);
 
     slave->stop();
 #else

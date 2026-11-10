@@ -97,36 +97,55 @@ public:
                                        std::uint16_t value) = 0;
 
     /// 写多个线圈（功能码 0F）。
-    virtual bool write_multiple_coils(std::uint8_t unit, std::uint16_t address,
-                                      const std::vector<bool>& values) = 0;
-
-    /// 写多个寄存器（功能码 10）。
-    virtual bool write_multiple_registers(std::uint8_t unit,
-                                          std::uint16_t address,
-                                          const std::vector<std::uint16_t>& values) = 0;
-
-    /// 上一次 `read_* / write_*` 返回 false 时，希望库回哪个异常码。
     ///
-    /// 默认 `none` ⇒ 库回标准码 `02`（illegal_data_address，改造前行为）。
-    /// 需要回别的码时（例如"事件记录区为空"按厂家规约要回 `03`），
-    /// 在返回 false **之前**把状态设成想要的码即可。
+    /// **不再是纯虚**：默认拒绝并回 `01`（illegal_function）。不支持 FC15/16
+    /// 的应用（例如只提供 05/06 单寄存器写的对外从站）**可以不实现**这两个方法，
+    /// 库不会把写多个请求透传到控制链路。需要支持时照常 override 即可。
+    virtual bool write_multiple_coils(std::uint8_t /*unit*/, std::uint16_t /*address*/,
+                                      const std::vector<bool>& /*values*/)
+    {
+        set_exception(Exception::illegal_function);
+        return false;
+    }
+
+    /// 写多个寄存器（功能码 10）。默认拒绝，语义同上。
+    virtual bool write_multiple_registers(std::uint8_t /*unit*/,
+                                          std::uint16_t /*address*/,
+                                          const std::vector<std::uint16_t>& /*values*/)
+    {
+        set_exception(Exception::illegal_function);
+        return false;
+    }
+
+    /// 设置"本次请求失败"时要回的异常码。
     ///
-    /// 场景（AM3SE 事件记录区）：
+    /// 应用只需在 `read_* / write_*` 返回 false **之前**调用一次：
     /// @code
-    ///     bool read_input_registers(addr, cnt, out) override {
-    ///         m_lastExc = Exception::none;              // ⚠️ 每次先复位
-    ///         if (addr != kEventArea) { ... }
+    ///     bool read_input_registers(..., std::vector<std::uint16_t>& out) override {
     ///         if (m_queue.empty()) {
-    ///             m_lastExc = Exception::illegal_data_value;   // 01 84 03
+    ///             set_exception(Exception::illegal_data_value);   // 01 84 03
     ///             return false;
     ///         }
     ///         ...
     ///     }
     /// @endcode
     ///
-    /// @warning 库**不会**自动清空它：一旦设成非 `none`，之后每次失败都会沿用。
-    ///          实现要在下一次调用开头自己复位（上面的例子第一行就是）。
-    virtual Exception last_exception() const { return Exception::none; }
+    /// 🔴 **库会在每个请求开始时自动复位**（`handle_pdu` 入口调 `clear_exception()`），
+    ///    应用不需要、也不应该自己缓存跨请求的异常状态。异常槽是 **thread_local**：
+    ///    TCP 多会话共享同一个 bank、回调跑在不同 io 线程上时，A 连接设的 03
+    ///    不会被 B 连接的 02 读到。
+    ///
+    /// 未设置 ⇒ 库回标准码 `02`（illegal_data_address，改造前行为）。
+    void set_exception(Exception e) const noexcept;
+
+    /// 库在每个请求开始时调用；应用一般不需要手动调用。
+    /// @note 若应用**覆盖**了 `last_exception()`，库只能复位自己这个槽，
+    ///       覆盖实现里的自定义状态仍由应用自己管理（旧代码兼容路径）。
+    void clear_exception() const noexcept;
+
+    /// 上一次 `read_* / write_*` 返回 false 时希望库回的异常码。
+    /// 默认返回库维护的每请求异常槽；保留 virtual 以兼容已有覆盖实现。
+    virtual Exception last_exception() const;
 };
 
 /// 从站。
@@ -256,8 +275,22 @@ public:
     ///
     /// @note 每个客户端是独立的会话，但共享同一个 `bank`。应用要保证 bank
     ///       线程安全（或者接受并发读写的语义）。
+    /// @note 这个重载固定监听 `0.0.0.0`；需要绑定指定网卡/地址用下面那个重载。
     [[nodiscard]] static std::shared_ptr<Slave>
     create_tcp(std::uint16_t port, const Config& cfg,
+               std::shared_ptr<RegisterBank> bank, std::error_code& ec,
+               std::shared_ptr<netmech::Runtime> runtime = nullptr);
+
+    /// TCP 从站（**可指定监听地址**）。
+    ///
+    /// @param[in] host 监听地址（IPv4/IPv6 字面量，如 `"127.0.0.1"` / `"::1"`）；
+    ///                 空串等价 `"0.0.0.0"`（监听所有网卡）。
+    /// @param[in] port 监听端口
+    ///
+    /// 修复：此前 `create_tcp(port, ...)` 把地址硬编码成 `0.0.0.0`，应用配了
+    /// `host` 也无法生效。原签名保留并转发到本重载，源码/调用方无需改动。
+    [[nodiscard]] static std::shared_ptr<Slave>
+    create_tcp(const std::string& host, std::uint16_t port, const Config& cfg,
                std::shared_ptr<RegisterBank> bank, std::error_code& ec,
                std::shared_ptr<netmech::Runtime> runtime = nullptr);
 
