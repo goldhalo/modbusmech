@@ -34,18 +34,7 @@ using namespace netmech_test;
 
 namespace {
 
-// 【诊断用】每个用例换一个端口：验证"端口复用"是否是 Windows Release 偶发失败的根因。
-inline std::optional<std::uint16_t> next_free_test_port()
-{
-    // 每个用例从轮换的起点开始扫，避免所有用例都挤在 40000 这个端口上
-    // （Windows 上快速"关掉重建同一个端口"会撞上 TIME_WAIT/关闭时序）。
-    static std::atomic<std::uint16_t> n{0};
-    const std::uint16_t base =
-        static_cast<std::uint16_t>(40000 + (n.fetch_add(1) * 8) % 800);
-    return netmech::find_free_port_run(base, 50000, 1, 1);
-}
-
-/// 用 port=0 让内核分配监听端口，彻底避开 find_free_port_run 的 TOCTOU 窗口。
+/// 用 port=0 让内核分配监听端口，彻底避开"先探测空闲端口再 bind"的 TOCTOU 窗口。
 /// 成功后把实际端口写回 port_out，供 Master 连接；失败时把 ec 打出来。
 inline std::shared_ptr<Slave> make_test_slave(const Slave::Config& cfg,
                                               std::shared_ptr<RegisterBank> bank,
@@ -732,9 +721,12 @@ public:
 struct OneShotServer {
     std::shared_ptr<netmech::Mechanism> mech;
     std::shared_ptr<OneShotLink>        link;
+    std::uint16_t                       port = 0;   // listen(:0) 后回读的实际端口
 };
 
-OneShotServer start_oneshot_server(std::uint16_t port)
+/// port=0 由内核分配端口，彻底避开"探测空闲端口 → 再 bind"的 TOCTOU 窗口。
+/// 回读的实际端口放在 srv.port，供 Master 连接；失败时打印 ec。
+OneShotServer start_oneshot_server()
 {
     OneShotServer srv;
     srv.mech = netmech::Mechanism::create();
@@ -742,11 +734,24 @@ OneShotServer start_oneshot_server(std::uint16_t port)
         return srv;
     }
     srv.link = std::make_shared<OneShotLink>();
-    std::error_code ec = srv.mech->listen(netmech::Address::any(port), srv.link);
+    std::error_code ec = srv.mech->listen(netmech::Address::any(0), srv.link);
     if (ec) {
+        std::fputs("[test] oneshot listen(:0) failed: ", stderr);
+        std::fputs(ec.message().c_str(), stderr);
+        std::fputc(10, stderr);
         srv.mech.reset();
         srv.link.reset();
+        return srv;
     }
+    const auto addrs = srv.mech->listening_addresses();
+    if (addrs.empty()) {
+        std::fputs("[test] oneshot listening_addresses() empty", stderr);
+        std::fputc(10, stderr);
+        srv.mech.reset();
+        srv.link.reset();
+        return srv;
+    }
+    srv.port = addrs.front().port();
     return srv;
 }
 
@@ -757,12 +762,10 @@ OneShotServer start_oneshot_server(std::uint16_t port)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_auto_reconnect_short_connection)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
-
-    auto server = start_oneshot_server(port);
+    auto server = start_oneshot_server();
     REQUIRE(server.mech != nullptr);
+    REQUIRE(server.port != 0u);
+    const std::uint16_t port = server.port;
 
     Master::Config mc;
     mc.timeout        = 1000ms;
@@ -795,12 +798,10 @@ NETMECH_TEST(tcp_master_auto_reconnect_short_connection)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(tcp_master_reconnect_disabled_reports_error)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
-
-    auto server = start_oneshot_server(port);
+    auto server = start_oneshot_server();
     REQUIRE(server.mech != nullptr);
+    REQUIRE(server.port != 0u);
+    const std::uint16_t port = server.port;
 
     Master::Config mc;
     mc.timeout        = 1000ms;
@@ -1051,9 +1052,12 @@ public:
 struct SilentServer {
     std::shared_ptr<netmech::Mechanism> mech;
     std::shared_ptr<SilentLink>         link;
+    std::uint16_t                       port = 0;   // listen(:0) 后回读的实际端口
 };
 
-SilentServer start_silent_server(std::uint16_t port)
+/// port=0 由内核分配端口，彻底避开"探测空闲端口 → 再 bind"的 TOCTOU 窗口。
+/// 回读的实际端口放在 srv.port，供 Master 连接；失败时打印 ec。
+SilentServer start_silent_server()
 {
     SilentServer srv;
     srv.mech = netmech::Mechanism::create();
@@ -1061,11 +1065,24 @@ SilentServer start_silent_server(std::uint16_t port)
         return srv;
     }
     srv.link = std::make_shared<SilentLink>();
-    std::error_code ec = srv.mech->listen(netmech::Address::any(port), srv.link);
+    std::error_code ec = srv.mech->listen(netmech::Address::any(0), srv.link);
     if (ec) {
+        std::fputs("[test] silent listen(:0) failed: ", stderr);
+        std::fputs(ec.message().c_str(), stderr);
+        std::fputc(10, stderr);
         srv.mech.reset();
         srv.link.reset();
+        return srv;
     }
+    const auto addrs = srv.mech->listening_addresses();
+    if (addrs.empty()) {
+        std::fputs("[test] silent listening_addresses() empty", stderr);
+        std::fputc(10, stderr);
+        srv.mech.reset();
+        srv.link.reset();
+        return srv;
+    }
+    srv.port = addrs.front().port();
     return srv;
 }
 
@@ -1143,12 +1160,10 @@ NETMECH_TEST(async_master_read_holding_registers)
 // ---------------------------------------------------------------------------
 NETMECH_TEST(async_master_timeout_callback_fires)
 {
-    const auto port_opt = next_free_test_port();
-    REQUIRE(port_opt.has_value());
-    const std::uint16_t port = static_cast<std::uint16_t>(*port_opt);
-
-    auto server = start_silent_server(port);
+    auto server = start_silent_server();
     REQUIRE(server.mech != nullptr);
+    REQUIRE(server.port != 0u);
+    const std::uint16_t port = server.port;
 
     AsyncMaster::Config ac;
     ac.timeout     = 150ms;
