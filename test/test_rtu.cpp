@@ -477,8 +477,16 @@ namespace {
 
 class StopOnWriteBank final : public RegisterBank {
 public:
-    std::shared_ptr<Slave> self;   ///< create_rtu 之后回填
-    std::atomic<int>       writes{0};
+    /// self 的读写跨线程（主线程赋值 / 帧线程回调读），必须加锁：
+    /// 裸 shared_ptr 的跨线程读写是数据竞争（TSan 会抓，同 netmech
+    /// test_support.hpp SyncSlot 的教训）。
+    void set_self(std::shared_ptr<Slave> s)
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_self = std::move(s);
+    }
+
+    std::atomic<int> writes{0};
 
     bool read_coils(std::uint8_t, std::uint16_t, std::uint16_t, std::vector<bool>&) override
     { return false; }
@@ -492,11 +500,20 @@ public:
     bool write_single_register(std::uint8_t, std::uint16_t, std::uint16_t) override
     {
         writes.fetch_add(1);
-        if (self) {
-            self->stop();   // 在帧线程回调里停机：修复前这里 terminate
+        std::shared_ptr<Slave> s;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            s = m_self;
+        }
+        if (s) {
+            s->stop();   // 在帧线程回调里停机：修复前这里 terminate
         }
         return true;
     }
+
+private:
+    std::mutex             m_mtx;
+    std::shared_ptr<Slave> m_self;   ///< create_rtu 之后由 set_self 回填
 };
 
 } // namespace
@@ -515,7 +532,7 @@ NETMECH_TEST(rtu_slave_stop_from_bank_callback_is_safe)
     std::error_code ec;
     auto slave = Slave::create_rtu(pty.slave, 9600, sc, bank, ec);
     REQUIRE(slave != nullptr);
-    bank->self = slave;
+    bank->set_self(slave);
 
     // 手写一条 06 写请求帧（unit=1, addr=0, value=0x1234）
     const std::vector<std::uint8_t> pdu{0x06, 0x00, 0x00, 0x12, 0x34};
