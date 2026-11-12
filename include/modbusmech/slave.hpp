@@ -12,9 +12,10 @@
 //    * 没有"库里的数组"和"应用里的数据"不一致的问题
 //
 //  ★ 线程
-//  `RegisterBank` 的方法在**该连接所在的 io 线程**上被调用（RTU 是唯一的串
-//  口线程，TCP 是每个客户端各自的回调）。同一个 bank 被多个连接共享时，应用
-//  需要自己加锁。
+//  `RegisterBank` 的回调线程按传输区分：
+//    * TCP：在该连接所在的 **netmech io 线程**上（每个客户端各自的回调）；
+//    * RTU：在库内部的**专用帧处理线程**上（不是 netmech 的串口 io 线程）。
+//  两种回调都**不得阻塞**。同一个 bank 被多个连接共享时，应用需要自己加锁。
 // =============================================================================
 #pragma once
 
@@ -171,7 +172,8 @@ public:
         /// 非空 ⇒ 每帧先向它要 bank；返回空 ⇒ 该 unit 视为"总线上不存在"，
         ///   **静默丢弃**（不回异常码 02 —— 真实设备不存在时同样不应答）。
         ///
-        /// @warning 回调在该传输的 io 线程上调用，实现必须线程安全。
+        /// @warning 回调线程同 RegisterBank（TCP 在 io 线程，RTU 在专用帧线程），
+        ///          实现必须线程安全、不得阻塞。
         std::function<std::shared_ptr<RegisterBank>(std::uint8_t)> bank_for;
 
         /// **连接建立回调**（只对 `create_tcp` 生效；RTU 是点对点串口，
@@ -242,6 +244,10 @@ public:
         /// RTU 的"帧结束"判定方式。
         enum class FrameBoundary {
             /// 靠 3.5 字符静默（规范做法）。需要高精度定时器。
+            ///
+            /// @warning Windows 默认定时器分辨率约 15.6ms，低波特率（如 9600
+            ///          的 3.5 字符 ≈ 4ms）下静默判定可能把相邻帧粘连或误切。
+            ///          Windows 上推荐用 length 模式，或显式调 silence_ms。
             silence,
 
             /// 靠"读够期望长度"（更可靠，但对未知请求不适用）。
@@ -249,7 +255,7 @@ public:
         };
         FrameBoundary boundary = FrameBoundary::silence;
 
-        /// 3.5 字符静默的**毫秒数**（按波特率算，1.5 字符用于 >19200）。
+        /// 3.5 字符静默的**毫秒数**（≤19200 按波特率算；>19200 规范固定 1.75ms）。
         ///
         /// @note 9600bps 的 3.5 字符 ≈ 4ms。设 0 表示按波特率自动计算。
         std::uint32_t silence_ms = 0;
@@ -345,6 +351,11 @@ public:
     };
     [[nodiscard]] Stats stats() const noexcept;
 
+    /// 停止从站（幂等）。
+    ///
+    /// @note 可以在 RegisterBank 回调里调用（典型：收到特定写请求后停机）：
+    ///       自线程调用时内部自动 detach，不会自 join；帧线程持有 Impl 的
+    ///       强引用，退出前对象不会析构。
     void stop() noexcept;
 
 private:

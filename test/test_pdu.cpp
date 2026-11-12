@@ -355,3 +355,66 @@ NETMECH_TEST(pdu_decode_rejects_bc_count_mismatch)
     CHECK_EQ(d.registers.size(), std::size_t{2});
     CHECK_EQ(d.registers[0], 0x1234);
 }
+
+// ---------------------------------------------------------------------------
+// 20. 定长功能码请求拒绝尾部垃圾字节（评审 s1）
+//
+//     回归：01/02/03/04/05/06 规范定长 5 字节，旧实现只查下限，
+//     05/06 从站会把尾部垃圾原样回显给对端（TCP 侧无 CRC 兜底）。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(pdu_decode_fixed_length_rejects_trailing_bytes)
+{
+    DecodedPdu d;
+
+    // 合法 5 字节 ⇒ 收
+    const Bytes ok03{0x03, 0x00, 0x00, 0x00, 0x0A};
+    CHECK(!decode_pdu(sp(ok03), d));
+
+    // 尾部多 1 字节 ⇒ bad_length（03 与 05 都查）
+    const Bytes tail03{0x03, 0x00, 0x00, 0x00, 0x0A, 0xFF};
+    CHECK(decode_pdu(sp(tail03), d) == ModbusErrc::bad_length);
+    const Bytes tail05{0x05, 0x00, 0x01, 0xFF, 0x00, 0xAA};
+    CHECK(decode_pdu(sp(tail05), d) == ModbusErrc::bad_length);
+    const Bytes tail06{0x06, 0x00, 0x01, 0x12, 0x34, 0x00, 0x00};
+    CHECK(decode_pdu(sp(tail06), d) == ModbusErrc::bad_length);
+
+    // 不足 5 字节 ⇒ 仍报 frame_too_short（错误码不变）
+    const Bytes short03{0x03, 0x00, 0x00, 0x00};
+    CHECK(decode_pdu(sp(short03), d) == ModbusErrc::frame_too_short);
+}
+
+// ---------------------------------------------------------------------------
+// 21. 05/06 写响应必须校验值回显（评审 m8）
+//
+//     回归：旧实现只校验地址回显，异常/恶意从站回显错值（写未生效）
+//     时主站仍判成功。规范要求响应原样回显请求的地址+值。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(pdu_write_response_checks_value_echo)
+{
+    Exception ex = Exception::none;
+
+    // 06：请求写 0x1234，响应回显 0x1234 ⇒ 成功
+    const Bytes ok06{0x06, 0x00, 0x05, 0x12, 0x34};
+    CHECK(!parse_write_response(sp(ok06), Function::write_single_register,
+                                0x0005, 1, 0x1234, ex));
+    CHECK(ex == Exception::none);
+
+    // 06：响应回显 0x9999（写未生效）⇒ unexpected_response
+    const Bytes bad06{0x06, 0x00, 0x05, 0x99, 0x99};
+    CHECK(parse_write_response(sp(bad06), Function::write_single_register,
+                               0x0005, 1, 0x1234, ex)
+          == ModbusErrc::unexpected_response);
+
+    // 05：请求 FF00（开），响应回显 0000（关）⇒ unexpected_response
+    const Bytes bad05{0x05, 0x00, 0x01, 0x00, 0x00};
+    CHECK(parse_write_response(sp(bad05), Function::write_single_coil,
+                               0x0001, 1, 0xFF00, ex)
+          == ModbusErrc::unexpected_response);
+    const Bytes ok05{0x05, 0x00, 0x01, 0xFF, 0x00};
+    CHECK(!parse_write_response(sp(ok05), Function::write_single_coil,
+                                0x0001, 1, 0xFF00, ex));
+
+    // legacy 5 参重载：不校验值回显（拿不到请求值，保持旧行为）
+    CHECK(!parse_write_response(sp(bad06), Function::write_single_register,
+                                0x0005, 1, ex));
+}

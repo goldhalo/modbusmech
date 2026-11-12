@@ -161,15 +161,32 @@ struct DecodedPdu {
     std::vector<bool>& bits, std::vector<std::uint16_t>& regs,
     Exception& ex) noexcept;
 
-/// 解析"写单个/多个"的响应（回显校验）。
+/// 解析"写单个/多个"的响应（回显校验，legacy 重载）。
 ///
 /// @param[in] pdu  完整响应 PDU
 /// @param[in] f    请求用的功能码
 /// @param[in] addr 请求的起始地址
 /// @param[in] cnt  请求的数量（05/06 传 1）
 /// @param[out] ex  异常码
+/// @note 本重载**不校验 05/06 的值回显**（拿不到请求值）；新代码请用
+///       带 value 参数的重载，主站内部已切换。
 [[nodiscard]] MODBUSMECH_API std::error_code parse_write_response(
     span<const std::uint8_t> pdu, Function f,
     std::uint16_t addr, std::uint16_t cnt, Exception& ex) noexcept;
+
+/// 解析"写单个/多个"的响应（回显校验，含 05/06 值回显）。
+///
+/// @param[in] pdu   完整响应 PDU
+/// @param[in] f     请求用的功能码
+/// @param[in] addr  请求的起始地址
+/// @param[in] cnt   请求的数量（0F/10 用；05/06 忽略）
+/// @param[in] value 请求写入的值（05/06 用：响应必须原样回显；0F/10 忽略）
+/// @param[out] ex   异常码
+/// @note 规范要求 05/06 响应原样回显请求的地址+值；值不对即写未生效，
+///       返回 unexpected_response，不能判成功。
+[[nodiscard]] MODBUSMECH_API std::error_code parse_write_response(
+    span<const std::uint8_t> pdu, Function f,
+    std::uint16_t addr, std::uint16_t cnt, std::uint16_t value,
+    Exception& ex) noexcept;
 
 } // namespace modbusmech

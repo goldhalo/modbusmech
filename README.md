@@ -211,6 +211,11 @@ cfg.parity    = modbusmech::SerialParity::even;     // 8E1
 cfg.stop_bits = modbusmech::SerialStopBits::one;
 ```
 
+> **Windows RTU 帧边界提示**：silence 模式依赖高精度定时器，Windows 默认
+> 分辨率约 15.6ms，低波特率（9600 的 3.5 字符 ≈ 4ms）下可能粘连/误切帧。
+> Windows 上推荐从站用 `Config::boundary = FrameBoundary::length`，或显式
+> 调 `silence_ms`；主站侧按功能码推长度收帧，不受此影响。
+
 ### TCP 从站的连接管理
 
 ```cpp
@@ -353,17 +358,20 @@ MIT，见 [LICENSE](LICENSE)。
 
 ## 发布为动态库（`-DBUILD_SHARED_LIBS=ON`）
 
-modbusmech 默认构建静态库；也可以构建动态库，**netmech 始终静态链入**（不产生额外的
-运行时依赖）。要点：
+modbusmech 默认构建静态库；也可以构建动态库。要点：
 
-1. **io 线程归属**：线程池在 `libmodbusmech.so` 内部，归本库所有；同进程其它模块
-   若各自静态链接 netmech，会各有一套线程池（**跨副本混用同一个 io_context 会崩**，
-   多模块共用请让 netmech 以共享库形式被共用）。
-2. **对外发布不需要 netmech 的二进制**，但需保留 netmech 的 MIT LICENSE 声明
-   （静态链接属于分发，MIT 要求保留版权与许可文本）。
-3. **符号卫生**：Linux/macOS 构建共享库时已用 `-Wl,--exclude-libs,ALL` 隐藏
-   静态链入的 netmech 符号；Windows 需要在公共 API 上加导出宏（`MODBUSMECH_API`），
-   **尚未实现** —— 在补齐之前，Windows 动态库不保证能正确导出/导入。
+1. **netmech 的形态随本库联动**：`BUILD_SHARED_LIBS=ON` 时 CMake 会强制
+   `NETMECH_LIBRARY_TYPE=SHARED`（避免同进程多份 io 运行时副本）。因此
+   **共享形态下 netmech 是独立的动态库，发布时必须随附 netmech 的
+   二进制（.so/.dll）及其 MIT LICENSE**；静态形态下 netmech 才静态链入
+   本库、对外不需 netmech 二进制（但仍需保留其 MIT 许可文本）。
+2. **io 线程归属**：同进程其它模块若各自静态链接 netmech，会各有一套
+   线程池（**跨副本混用同一个 io_context 会崩**）；多模块共用请让 netmech
+   以共享库形式被共用（见下节）。
+3. **符号卫生**：Linux/macOS 构建共享库时用 `-Wl,--exclude-libs,ALL` 隐藏
+   静态链入的依赖符号（共享形态下 netmech 是独立 .so，不受此选项影响）。
+   Windows 导出宏（`MODBUSMECH_API`，export.hpp）**已实现**：库内 dllexport、
+   使用方 dllimport，CMake 自动接线 `MODBUSMECH_SHARED`/`MODBUSMECH_BUILDING_LIBRARY`。
 4. **卸载（dlclose）前**必须 `close()` 全部对象并 `netmech::shutdown()`：
    io 线程运行在 `.so` 的代码里，卸载后线程再执行会崩。进程正常退出时有兜底
    （静态析构里 join 线程）。

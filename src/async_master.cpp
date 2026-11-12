@@ -31,7 +31,7 @@ namespace modbusmech {
 //  Impl
 // =============================================================================
 
-class AsyncMaster::Impl {
+class AsyncMaster::Impl : public std::enable_shared_from_this<AsyncMaster::Impl> {
 public:
     Config                  cfg;
     std::shared_ptr<Master> master;
@@ -40,7 +40,10 @@ public:
     std::mutex                       q_mtx;
     std::condition_variable          q_cv;
     std::deque<std::function<void()>> tasks;
-    bool                             closing = false;
+    /// 关闭标志。原子：is_running() 在任意线程无锁读（旧实现是普通 bool，
+    /// 与 close() 的写构成数据竞争）。check-and-set 仍在 q_mtx 下，
+    /// 与 submit 的入队互斥，保证"已排队的任务必定被排空"。
+    std::atomic<bool>                closing{false};
 
     // ---- 完成队列（派发线程消费）----
     std::mutex                       c_mtx;
@@ -56,12 +59,15 @@ public:
 
     void start()
     {
+        // ★ 强自持：线程捕获 shared_ptr<Impl>，保证 Impl 活到线程退出。
+        //   这是"回调里调 close()"能安全 detach 自身的前提（见 close()）。
+        auto self = shared_from_this();
         const std::size_t n = cfg.max_workers == 0 ? 1u : cfg.max_workers;
         workers.reserve(n);
         for (std::size_t i = 0; i < n; ++i) {
-            workers.emplace_back([this] { worker_loop(); });
+            workers.emplace_back([self] { self->worker_loop(); });
         }
-        dispatcher = std::thread([this] { dispatch_loop(); });
+        dispatcher = std::thread([self] { self->dispatch_loop(); });
     }
 
     /// 把"回调"投递到派发线程。@return false 表示派发线程已停（调用方自行执行）。
@@ -83,7 +89,7 @@ public:
     {
         {
             std::lock_guard<std::mutex> lk(q_mtx);
-            if (closing) {
+            if (closing.load(std::memory_order_acquire)) {
                 return false;
             }
             tasks.push_back(std::move(task));
@@ -97,10 +103,10 @@ public:
     {
         {
             std::lock_guard<std::mutex> lk(q_mtx);
-            if (closing) {
+            if (closing.load(std::memory_order_acquire)) {
                 return;
             }
-            closing = true;   // 不再接收新任务；已排队的继续跑完（回调仍会触发）
+            closing.store(true, std::memory_order_release);   // 不再接收新任务；已排队的继续跑完（回调仍会触发）
         }
         q_cv.notify_all();
 
@@ -125,6 +131,22 @@ public:
         if (dispatcher.joinable() && dispatcher.get_id() != self) {
             dispatcher.join();
         }
+
+        // ★ 自线程调用（用户在回调里调 close()）：不能 join 自己，但也
+        //   绝不能留下 joinable 的线程对象 —— ~Impl 销毁 joinable 的
+        //   std::thread 是 std::terminate（旧实现的 bug）。detach 自身：
+        //   线程对象变 non-joinable，真实线程由 start() 的强自持
+        //   shared_ptr<Impl> 保证活到循环自然结束，Impl 在最后一个
+        //   退出的线程上销毁。外部调用方（~AsyncMaster）此时提前返回
+        //   也安全。
+        for (std::thread& t : workers) {
+            if (t.joinable() && t.get_id() == self) {
+                t.detach();
+            }
+        }
+        if (dispatcher.joinable() && dispatcher.get_id() == self) {
+            dispatcher.detach();
+        }
     }
 
     /// 通用的"提交一次请求"：把阻塞调用放进工作线程，回调用派发线程执行。
@@ -134,14 +156,19 @@ public:
     template <typename RunFn, typename DoneFn>
     void submit_request(RunFn&& run, DoneFn&& done)
     {
-        auto task = [this, run = std::forward<RunFn>(run),
-                     done = std::forward<DoneFn>(done)]() mutable {
+        // ★ done 包进 shared_ptr 由 task 与 reject 共享：submit 失败（closing）
+        //   走 reject、成功走 task —— 两条路只走一条，但两个 lambda 都会被
+        //   构造，done 绝不能被 move 进其中任何一个（旧实现双重移动，
+        //   reject 捕获的 done 已被移空 → bad_function_call / 空指针，
+        //   回调静默丢失或抛到调用线程）。
+        auto shared_done = std::make_shared<std::decay_t<DoneFn>>(std::forward<DoneFn>(done));
+        auto task = [this, run = std::forward<RunFn>(run), shared_done]() mutable {
             const Result r = run();
             // 完成动作：先减计数再回调。做成 std::function 是为了能"尝试投递、
             // 投递失败就地执行"——两条路只走一条，保证回调恰好一次。
-            std::function<void()> finish = [this, r, d = std::move(done)]() mutable {
+            std::function<void()> finish = [this, r, shared_done]() mutable {
                 pending.fetch_sub(1, std::memory_order_relaxed);
-                d(r);
+                (*shared_done)(r);
             };
             const std::function<void()> copy = finish;   // post 按值入队
             if (!post(copy)) {
@@ -151,11 +178,10 @@ public:
         if (!submit(std::move(task))) {
             // 已提交失败（正在关闭）：立刻按"未连接"回调。
             // 注意：submit 没成功就不会 pending++，这里也不做 pending--。
-            std::function<void()> reject =
-                [d = std::forward<DoneFn>(done)]() mutable {
-                    d(Result{make_error_code(ModbusErrc::not_connected),
-                             Exception::none});
-                };
+            std::function<void()> reject = [shared_done]() mutable {
+                (*shared_done)(Result{make_error_code(ModbusErrc::not_connected),
+                                      Exception::none});
+            };
             const std::function<void()> copy = reject;
             if (!post(copy)) {
                 reject();
@@ -402,7 +428,7 @@ std::size_t AsyncMaster::pending_count() const noexcept
 
 bool AsyncMaster::is_running() const noexcept
 {
-    return m_impl && !m_impl->closing;
+    return m_impl && !m_impl->closing.load(std::memory_order_acquire);
 }
 
 void AsyncMaster::close() noexcept

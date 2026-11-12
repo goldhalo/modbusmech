@@ -49,7 +49,8 @@ std::uint16_t get_u16(const std::uint8_t* p)
 
 class TcpTransport::Handler final : public netmech::ConnHandler {
 public:
-    explicit Handler(std::shared_ptr<TcpTransport> owner) : m_owner(std::move(owner)) {}
+    Handler(std::shared_ptr<TcpTransport> owner, std::uint64_t generation)
+        : m_owner(std::move(owner)), m_generation(generation) {}
 
     bool on_open(std::shared_ptr<netmech::Conn> conn) override
     {
@@ -70,11 +71,12 @@ public:
         }
         if (ec) {
             // 读出错 = 这条连接废了。只标记（允许后续按需重连），不 close()。
-            owner->mark_dropped();
+            // 带上代际：重连后旧 Handler 的迟到回调不得误杀新连接的事务。
+            owner->mark_dropped(m_generation);
             return;
         }
         if (n > 0) {
-            owner->on_bytes(static_cast<const std::uint8_t*>(buf.data), n);
+            owner->on_bytes(static_cast<const std::uint8_t*>(buf.data), n, m_generation);
         }
         start_read();
     }
@@ -83,16 +85,16 @@ public:
     {
         if (ec) {
             if (auto owner = m_owner.lock()) {
-                owner->mark_dropped();
+                owner->mark_dropped(m_generation);
             }
         }
     }
 
     void on_close() override
     {
-        // 连接已经关了：标记 + 唤醒所有在途等待者（它们只会拿到 not_connected）。
+        // 连接已经关了：标记 + 唤醒同代的在途等待者（它们只会拿到 not_connected）。
         if (auto owner = m_owner.lock()) {
-            owner->mark_dropped();
+            owner->mark_dropped(m_generation);
         }
     }
 
@@ -106,6 +108,7 @@ public:
 private:
     std::shared_ptr<netmech::Conn> m_conn;   ///< 本连接（io 线程内读写）
     std::weak_ptr<TcpTransport>    m_owner;
+    std::uint64_t                  m_generation;   ///< 创建时的连接代际
 };
 
 // =============================================================================
@@ -199,7 +202,9 @@ bool TcpTransport::connect_once(std::error_code& ec)
 
     // 每次连接用一套新的 Handler/Link：旧的 Conn 可能还持有旧的 handler，
     // 复用它会让两代连接共享同一个读缓冲。
-    auto handler  = std::make_shared<Handler>(shared_from_this());
+    // 代际递增：旧 Handler 的迟到回调只影响同代 Pending（M4）。
+    const std::uint64_t gen = m_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    auto handler  = std::make_shared<Handler>(shared_from_this(), gen);
     auto link     = std::make_shared<Link>();
     link->handler = handler;
     m_link        = link;   // 必须存住，否则 Mechanism 的 weak_ptr 失效
@@ -243,7 +248,10 @@ bool TcpTransport::connect_once(std::error_code& ec)
         }
     }
 
-    m_conn = std::move(connected);
+    {
+        std::lock_guard<std::mutex> lk(m_conn_mtx);
+        m_conn = std::move(connected);
+    }
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_alive = true;
@@ -267,6 +275,21 @@ bool TcpTransport::ensure_connected(std::error_code& ec)
         ec = make_error_code(ModbusErrc::not_connected);
         return false;
     }
+    // ★ 串行化按需重连（双重检查）：断链后多个线程可能同时看到
+    //   !is_open()，不串行化就会并发进 connect_once（m_mech/m_link/m_conn
+    //   并发写 = UB）并向对端发起多条连接。第一个进锁的线程重连，
+    //   其余看到连接已就绪直接返回。
+    std::lock_guard<std::mutex> rlk(m_reconnect_mtx);
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_closed) {
+            ec = make_error_code(ModbusErrc::not_connected);
+            return false;
+        }
+    }
+    if (is_open()) {
+        return true;
+    }
     // 按需建连：建连**失败/超时就直接返回失败**（由调用方决定要不要再试），
     // 不在这里做重试循环 —— 短连接设备更需要的是"快速失败"，而不是拖着。
     if (!connect_once(ec)) {
@@ -278,10 +301,16 @@ bool TcpTransport::ensure_connected(std::error_code& ec)
 
 bool TcpTransport::is_open() const noexcept
 {
-    return m_conn && m_conn->is_open();
+    std::shared_ptr<netmech::Conn> conn;
+    {
+        std::lock_guard<std::mutex> lk(m_conn_mtx);
+        conn = m_conn;
+    }
+    return conn && conn->is_open();
 }
 
-void TcpTransport::on_bytes(const std::uint8_t* data, std::size_t n)
+void TcpTransport::on_bytes(const std::uint8_t* data, std::size_t n,
+                            std::uint64_t generation)
 {
     struct Frame {
         std::uint16_t             tid = 0;
@@ -292,6 +321,11 @@ void TcpTransport::on_bytes(const std::uint8_t* data, std::size_t n)
 
     {
         std::lock_guard<std::mutex> lk(m_mtx);
+        // 旧代际连接的迟到的字节不得混入新连接的接收缓冲
+        // （重连时 m_rx 已清，旧 Handler 随后投递的读完成会污染新帧）。
+        if (generation != m_generation.load(std::memory_order_acquire)) {
+            return;
+        }
         m_rx.insert(m_rx.end(), data, data + n);
 
         for (;;) {
@@ -366,16 +400,21 @@ void TcpTransport::dispatch_frame(std::uint16_t tid, std::uint8_t unit,
     p->cv.notify_all();
 }
 
-void TcpTransport::fail_all(const std::error_code& ec) noexcept
+void TcpTransport::fail_all(const std::error_code& ec, std::uint64_t generation) noexcept
 {
     // ★ 只把错误写进各个 Pending，**不清表**：结果由各自的 receive() 取走，
     //   取走时再摘除。和 dispatch_frame 同理 —— 清表会让"响应/关闭先到、
     //   receive() 后到"的路径查不到条目而误报 not_connected。
+    // ★ 代际过滤（generation != 0 时）：旧连接的迟到回调只能失败同代
+    //   条目 —— 重连后新连接上刚登记的在途事务不能被误杀（M4）。
     std::vector<std::shared_ptr<Pending>> victims;
     {
         std::lock_guard<std::mutex> lk(m_pending_mtx);
         victims.reserve(m_pending.size());
         for (auto& kv : m_pending) {
+            if (generation != 0 && kv.second->generation != generation) {
+                continue;
+            }
             victims.push_back(kv.second);
         }
     }
@@ -427,6 +466,7 @@ std::error_code TcpTransport::send(span<const std::uint8_t> pdu, std::uint8_t un
         }
         p->tid  = m_next_tid++;
         p->unit = unit;
+        p->generation = m_generation.load(std::memory_order_acquire);
         m_pending.emplace(p->tid, p);
     }
     tid = p->tid;
@@ -441,7 +481,11 @@ std::error_code TcpTransport::send(span<const std::uint8_t> pdu, std::uint8_t un
     adu.insert(adu.end(), pdu.begin(), pdu.end());
 
     auto holder = std::make_shared<std::vector<std::uint8_t>>(std::move(adu));
-    const std::shared_ptr<netmech::Conn> conn = m_conn;   // 本线程内的快照
+    std::shared_ptr<netmech::Conn> conn;
+    {
+        std::lock_guard<std::mutex> lk(m_conn_mtx);
+        conn = m_conn;   // 本线程内的快照（受锁保护，不与重连并发写竞争）
+    }
     if (!conn || !conn->write(netmech::ConstBuf{holder, holder->data(), holder->size()})) {
         std::lock_guard<std::mutex> lk(m_pending_mtx);
         m_pending.erase(tid);
@@ -502,9 +546,14 @@ void TcpTransport::close() noexcept
         m_closed = true;   // 用户显式关闭：此后不再自动重连
         m_alive  = false;
     }
-    fail_all(make_error_code(ModbusErrc::not_connected));
-    if (m_conn) {
-        m_conn->close();
+    fail_all(make_error_code(ModbusErrc::not_connected));   // 用户显式关闭：全部代际
+    std::shared_ptr<netmech::Conn> conn;
+    {
+        std::lock_guard<std::mutex> lk(m_conn_mtx);
+        conn = m_conn;
+    }
+    if (conn) {
+        conn->close();
     }
     if (m_mech) {
         m_mech->close_all();

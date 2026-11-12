@@ -49,10 +49,15 @@ public:
         std::atomic<std::uint64_t> succeeded{0};
         std::atomic<std::uint64_t> timeouts{0};
         std::atomic<std::uint64_t> send_errors{0};
+        std::atomic<std::uint64_t> recv_errors{0};
         std::atomic<std::uint64_t> exceptions{0};
         std::atomic<std::uint64_t> crc_errors{0};
     };
     StatsAtomic                        stats;
+
+    /// RTU 事务独占标志：半双工总线同一时刻只允许一笔事务（send+receive+
+    /// 重试整体），并发调用拿 busy（与 TCP 配额同口径，见 master.hpp）。
+    std::atomic<bool>                  rtu_busy{false};
 
     /// 发一个 PDU，收一个响应 PDU。
     ///
@@ -73,6 +78,23 @@ public:
         if (!transport) {
             ec = make_error_code(ModbusErrc::not_connected);
             return;
+        }
+
+        // ★ RTU 半双工：总线同一时刻只允许一笔事务，并发调用直接 busy。
+        //   不加守卫时两帧会交错写上总线（RS-485 物理冲突），且各自
+        //   可能收到对方的响应。守卫覆盖整个事务（含重试），RAII 释放。
+        struct RtuUnlock {
+            std::atomic<bool>* flag;
+            ~RtuUnlock() { if (flag) { flag->store(false, std::memory_order_release); } }
+        } rtu_unlock{nullptr};
+        if (transport->is_rtu()) {
+            bool expected = false;
+            if (!rtu_busy.compare_exchange_strong(expected, true,
+                                                  std::memory_order_acq_rel)) {
+                ec = make_error_code(ModbusErrc::busy);
+                return;
+            }
+            rtu_unlock.flag = &rtu_busy;
         }
         // ★ 这里**不再**预检查 transport->is_open()：TCP 短连接设备回完一个
         //   响应就断开，send() 内部会按需自动重连（ensure_connected）。在这里
@@ -107,8 +129,12 @@ public:
             if (ec) {
                 if (ec == ModbusErrc::crc_mismatch) {
                     stats.crc_errors.fetch_add(1, std::memory_order_relaxed);
-                } else {
+                } else if (ec == ModbusErrc::timeout) {
                     stats.timeouts.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    // 断链 / unit 不匹配等接收侧错误：不再混进 timeouts
+                    // （旧实现一律计超时，断链场景 timeouts 虚高，掩盖真实故障）。
+                    stats.recv_errors.fetch_add(1, std::memory_order_relaxed);
                 }
                 // ★ 失败后重同步（传输层语义，见 transport.hpp）：
                 //   RTU 没有事务号，本笔超时后从站的**迟到响应**可能在下一笔
@@ -144,6 +170,14 @@ public:
                    std::vector<std::uint16_t>* regs)
 {
     Result r;
+
+    // ★ RTU 广播读无意义：从站对广播帧执行但不应答，读请求发出去
+    //   永远等不到响应。直接拒绝，不让调用方傻等超时。
+    //   （TCP 没有广播概念，unit=0 按普通地址处理，不受此限。）
+    if (unit == 0 && transport && transport->is_rtu()) {
+        r.ec = make_error_code(ModbusErrc::invalid_argument);
+        return r;
+    }
 
     std::vector<std::uint8_t> pdu;
     std::error_code ec;
@@ -197,6 +231,23 @@ public:
     Result r;
     std::error_code ec;
 
+    // ★ RTU 广播写（unit=0）：规范规定从站**执行但不应答** —— 发送即返回，
+    //   不等响应、不重试。旧实现傻等超时后按 retries 重发，同一条广播写
+    //   被从站执行两次（继电器等控制场景有实际危害）。
+    //   （TCP 没有广播概念，unit=0 按普通地址走正常事务。）
+    if (unit == 0 && transport && transport->is_rtu()) {
+        stats.requests.fetch_add(1, std::memory_order_relaxed);
+        std::uint16_t tid = 0;
+        ec = transport->send(span<const std::uint8_t>(pdu.data(), pdu.size()), 0, tid);
+        if (ec) {
+            r.ec = ec;
+            stats.send_errors.fetch_add(1, std::memory_order_relaxed);
+            return r;
+        }
+        stats.succeeded.fetch_add(1, std::memory_order_relaxed);
+        return r;
+    }
+
     std::vector<std::uint8_t> resp;
     transaction(unit, span<const std::uint8_t>(pdu.data(), pdu.size()), resp, ec);
     if (ec) {
@@ -204,9 +255,17 @@ public:
         return r;
     }
 
+    // 05/06 的响应要校验**值回显**：从请求 PDU 里取出写入值传给解析层。
+    std::uint16_t req_value = 0;
+    if ((f == Function::write_single_coil || f == Function::write_single_register)
+        && pdu.size() >= 5) {
+        req_value = static_cast<std::uint16_t>((static_cast<std::uint16_t>(pdu[3]) << 8)
+                                               | pdu[4]);
+    }
+
     Exception ex = Exception::none;
     ec = parse_write_response(span<const std::uint8_t>(resp.data(), resp.size()),
-                              f, address, count, ex);
+                              f, address, count, req_value, ex);
     if (ec) {
         r.ec = ec;
         return r;
@@ -321,6 +380,7 @@ Master::Stats Master::stats() const noexcept
     out.succeeded   = m_impl->stats.succeeded.load(std::memory_order_relaxed);
     out.timeouts    = m_impl->stats.timeouts.load(std::memory_order_relaxed);
     out.send_errors = m_impl->stats.send_errors.load(std::memory_order_relaxed);
+    out.recv_errors = m_impl->stats.recv_errors.load(std::memory_order_relaxed);
     out.exceptions  = m_impl->stats.exceptions.load(std::memory_order_relaxed);
     out.crc_errors  = m_impl->stats.crc_errors.load(std::memory_order_relaxed);
     // 重连次数在传输层（只有 TCP 会重连；RTU 恒 0）。

@@ -94,10 +94,10 @@ endif()
 # ---------------------------------------------------------------------------
 # 发布成动态库（-DBUILD_SHARED_LIBS=ON）时的符号卫生
 #
-# netmech 是**静态**链入本库的：它的线程池/asio 状态会随本 .so 一起打包。
-# 默认可见性下，netmech 的内部符号会全部从本 .so 导出（实测 257 个）——
-# 既污染 ABI，也可能被同进程其它模块的符号解析"撞上"。这里把静态库符号隐藏，
-# 只导出本库自己的符号（Linux/macOS）。
+# 共享形态下 netmech 被强制为 SHARED（见上方）：它是独立的动态库，
+# 发布时需随附其二进制与 LICENSE。--exclude-libs 隐藏的是**静态**链入
+# 本 .so 的依赖符号（避免污染 ABI / 被同进程其它模块的符号解析撞上）；
+# 对共享形态的 netmech 不适用（它不在静态归档里）。
 #
 # Windows 走 MODBUSMECH_API（export.hpp）：库内 dllexport、使用方 dllimport，
 # 使用方需要定义 MODBUSMECH_SHARED（CMake target 会传递）。

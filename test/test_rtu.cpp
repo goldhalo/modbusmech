@@ -8,6 +8,7 @@
 // ============================================================================
 #include <modbusmech/master.hpp>
 #include <modbusmech/pdu.hpp>
+#include <modbusmech/slave.hpp>
 
 #include <netmech/net.hpp>
 
@@ -364,4 +365,173 @@ NETMECH_TEST(master_rejects_bad_serial_params)
     m = Master::create_rtu("/dev/null", cfg, 9600, ec);
     CHECK(m == nullptr);
     CHECK_EQ(ec, make_error_code(ModbusErrc::invalid_argument));
+}
+
+// ---------------------------------------------------------------------------
+// 7. RTU 广播写（unit=0）：发送即返回，从站只执行一次（评审 M5）
+//
+//    回归：旧实现无 unit==0 分支，广播写傻等超时后按 retries 重发，
+//    同一条写被从站执行多次（继电器等控制场景有危害）。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(rtu_broadcast_write_executes_once_without_response)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    Master::Config cfg;
+    cfg.unit        = 1;
+    cfg.timeout     = 300ms;
+    cfg.retries     = 2;      // 修复前：广播会等满超时并重发 2 次
+    cfg.retry_delay = 10ms;
+
+    std::error_code ec;
+    auto master = Master::create_rtu(pty.slave, cfg, 9600, ec);
+    REQUIRE(master != nullptr);
+
+    // 假从站：只收不应答（广播语义），统计收到的帧数
+    std::atomic<int> frames{0};
+    std::thread listener([&] {
+        std::uint8_t buf[8];
+        while (frames.load() < 3) {
+            if (!read_exact(pty.master, buf, 8, 400ms)) { break; }
+            frames.fetch_add(1);
+        }
+    });
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r = master->write_single_register(0, 5, 0x1234);   // unit=0 广播
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+
+    CHECK(r.ok());                // 修复前：傻等超时，r.ec == timeout
+    CHECK(elapsed < 200ms);       // 发送即返回，不等响应
+    listener.join();
+    CHECK_EQ(frames.load(), 1);   // 修复前：1 + retries = 3 帧（重复执行）
+
+    // 广播读：无意义，直接拒绝，不上线
+    std::vector<std::uint16_t> regs;
+    const auto rr = master->read_holding_registers(0, 0, 1, regs);
+    CHECK(rr.ec == ModbusErrc::invalid_argument);
+
+    master->close();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 8. RTU 并发调用返回 busy（评审 m5）
+//
+//    回归：master.hpp 承诺并发调用拿 busy，但旧实现 RTU 无事务守卫，
+//    两帧会交错写上总线（RS-485 物理冲突）。现用事务级独占标志。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(rtu_concurrent_transaction_returns_busy)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+    // 不放假从站：第一笔事务必然等满超时，占住总线
+
+    Master::Config cfg;
+    cfg.unit    = 1;
+    cfg.timeout = 500ms;
+    cfg.retries = 0;
+
+    std::error_code ec;
+    auto master = Master::create_rtu(pty.slave, cfg, 9600, ec);
+    REQUIRE(master != nullptr);
+
+    Result first_r;
+    std::thread t1([&] {
+        std::vector<std::uint16_t> regs;
+        first_r = master->read_holding_registers(0, 1, regs);
+    });
+
+    std::this_thread::sleep_for(100ms);   // 等第一笔占住总线
+
+    std::vector<std::uint16_t> regs2;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r2 = master->read_holding_registers(0, 1, regs2);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+
+    CHECK(r2.ec == ModbusErrc::busy);   // 修复前：无守卫，同样等满超时
+    CHECK(elapsed < 200ms);
+
+    t1.join();
+    CHECK(first_r.ec == ModbusErrc::timeout);
+    master->close();
+#else
+    CHECK(true);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 9. RTU 从站：bank 回调里调 stop() 不得 terminate（评审 M2 同族）
+//
+//    回归：Slave::stop() 无 self-id 守卫，帧线程上的 bank 回调里调
+//    stop() 会自 join → std::system_error 在 noexcept 里抛出 → terminate。
+// ---------------------------------------------------------------------------
+namespace {
+
+class StopOnWriteBank final : public RegisterBank {
+public:
+    std::shared_ptr<Slave> self;   ///< create_rtu 之后回填
+    std::atomic<int>       writes{0};
+
+    bool read_coils(std::uint8_t, std::uint16_t, std::uint16_t, std::vector<bool>&) override
+    { return false; }
+    bool read_discrete_inputs(std::uint8_t, std::uint16_t, std::uint16_t,
+                              std::vector<bool>&) override { return false; }
+    bool read_holding_registers(std::uint8_t, std::uint16_t, std::uint16_t,
+                                std::vector<std::uint16_t>&) override { return false; }
+    bool read_input_registers(std::uint8_t, std::uint16_t, std::uint16_t,
+                              std::vector<std::uint16_t>&) override { return false; }
+    bool write_single_coil(std::uint8_t, std::uint16_t, bool) override { return false; }
+    bool write_single_register(std::uint8_t, std::uint16_t, std::uint16_t) override
+    {
+        writes.fetch_add(1);
+        if (self) {
+            self->stop();   // 在帧线程回调里停机：修复前这里 terminate
+        }
+        return true;
+    }
+};
+
+} // namespace
+
+NETMECH_TEST(rtu_slave_stop_from_bank_callback_is_safe)
+{
+#if defined(__linux__)
+    Pty pty;
+    REQUIRE(pty.open_());
+
+    auto bank = std::make_shared<StopOnWriteBank>();
+    Slave::Config sc;
+    sc.address  = 1;
+    sc.boundary = Slave::Config::FrameBoundary::length;   // pty 一次到齐，length 更稳
+
+    std::error_code ec;
+    auto slave = Slave::create_rtu(pty.slave, 9600, sc, bank, ec);
+    REQUIRE(slave != nullptr);
+    bank->self = slave;
+
+    // 手写一条 06 写请求帧（unit=1, addr=0, value=0x1234）
+    const std::vector<std::uint8_t> pdu{0x06, 0x00, 0x00, 0x12, 0x34};
+    write_adu(pty.master, 1, pdu);
+
+    // 修复前：bank 回调里自 join → terminate，进程直接死
+    bool stopped = false;
+    for (int i = 0; i < 200; ++i) {
+        if (!slave->is_running()) { stopped = true; break; }
+        std::this_thread::sleep_for(10ms);
+    }
+    CHECK(stopped);
+    CHECK_EQ(bank->writes.load(), 1);
+
+    slave->stop();   // 幂等
+#else
+    CHECK(true);
+#endif
 }

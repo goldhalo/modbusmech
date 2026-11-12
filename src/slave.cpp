@@ -799,8 +799,9 @@ bool Slave::Impl::handle_pdu(std::uint8_t unit, RegisterBank& b,
         const BankResult br = call_bank([&] { return b.write_single_coil(unit, d.address, d.value == 0xFF00); });
         if (br == BankResult::threw)   { return true; }
         if (br == BankResult::refused) { exception(bank_error()); return true; }
-        // 回显原请求
-        resp.assign(pdu.begin(), pdu.end());
+        // 回显原请求（规范定长 5 字节；decode_pdu 已拒绝尾部垃圾，
+        // 这里显式取前 5 字节做防御性截断，绝不把多余字节回显给对端）。
+        resp.assign(pdu.begin(), pdu.begin() + 5);
         return true;
     }
 
@@ -808,7 +809,8 @@ bool Slave::Impl::handle_pdu(std::uint8_t unit, RegisterBank& b,
         const BankResult br = call_bank([&] { return b.write_single_register(unit, d.address, d.value); });
         if (br == BankResult::threw)   { return true; }
         if (br == BankResult::refused) { exception(bank_error()); return true; }
-        resp.assign(pdu.begin(), pdu.end());
+        // 同 05：定长 5 字节回显，防御性截断。
+        resp.assign(pdu.begin(), pdu.begin() + 5);
         return true;
     }
 
@@ -1036,7 +1038,16 @@ void Slave::stop() noexcept
     }
     m_impl->stop();
     if (m_impl->m_thread.joinable()) {
-        m_impl->m_thread.join();
+        if (m_impl->m_thread.get_id() == std::this_thread::get_id()) {
+            // ★ 在帧线程上调用（典型：bank 回调里"收到某写请求后停机"）：
+            //   join 自己是 UB（std::system_error 在 noexcept 里抛出 → terminate）。
+            //   detach：线程对象变 non-joinable；帧线程创建时捕获了
+            //   shared_ptr<Impl>（强自持），m_stop 已置位，run() 随即
+            //   退出并释放 Impl —— 无 UAF、无 terminate。
+            m_impl->m_thread.detach();
+        } else {
+            m_impl->m_thread.join();
+        }
     }
     if (m_impl->mech) {
         m_impl->mech->close_all();

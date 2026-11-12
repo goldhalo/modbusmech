@@ -113,6 +113,9 @@ private:
     struct Pending {
         std::uint16_t             tid = 0;
         std::uint8_t              unit = 0;
+        /// 登记时的连接代际（见 m_generation）：旧连接的迟到回调
+        /// 只能失败同代条目，不能误杀新连接上的在途事务。
+        std::uint64_t             generation = 0;
         std::mutex                mtx;
         std::condition_variable   cv;
         bool                      done = false;
@@ -131,23 +134,28 @@ private:
     /// 需要时确保连接可用（仅当 auto_reconnect 开启）。
     bool ensure_connected(std::error_code& ec);
 
-    void on_bytes(const std::uint8_t* data, std::size_t n);
+    void on_bytes(const std::uint8_t* data, std::size_t n, std::uint64_t generation);
 
     /// 把一个完整帧交付给对应的等待者（找不到 = 迟到的响应，丢弃）。
     void dispatch_frame(std::uint16_t tid, std::uint8_t unit,
                         std::vector<std::uint8_t>&& pdu);
 
-    /// 让所有在途请求立刻以 @p ec 结束（连接断开 / 关闭）。
-    void fail_all(const std::error_code& ec) noexcept;
+    /// 让在途请求立刻以 @p ec 结束（连接断开 / 关闭）。
+    /// @param generation 只失败该代际的条目；0 = 全部（用户显式 close）。
+    void fail_all(const std::error_code& ec, std::uint64_t generation = 0) noexcept;
 
     /// 对端关闭 / IO 错误：当前连接不可用，但**允许**后续按需重连。
-    void mark_dropped() noexcept
+    /// @param generation 发起回调的 Handler 所属代际：旧代际的迟到回调
+    ///                   不能把新连接标记为不可用，也不能误杀新代际的在途事务。
+    void mark_dropped(std::uint64_t generation) noexcept
     {
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            m_alive = false;
+            if (generation == m_generation.load(std::memory_order_acquire)) {
+                m_alive = false;
+            }
         }
-        fail_all(make_error_code(ModbusErrc::not_connected));
+        fail_all(make_error_code(ModbusErrc::not_connected), generation);
     }
 
     /// connect 的回调：拿 Conn 并交给 Handler。
@@ -158,9 +166,19 @@ private:
     std::uint16_t                       m_port = 0;
     std::shared_ptr<netmech::Mechanism> m_mech;
     std::shared_ptr<Link>               m_link;
-    std::shared_ptr<netmech::Conn>      m_conn;
+    std::shared_ptr<netmech::Conn>      m_conn;    ///< 受 m_conn_mtx 保护
 
     mutable std::mutex        m_mtx;      ///< 保护 m_rx / m_alive / m_closed
+    /// 保护 m_conn 的读写（短临界区，只做快照/赋值）。
+    /// 旧实现无锁读写 shared_ptr：调用线程（send/is_open/close）与
+    /// 重连线程并发时是标准定义的 UB（TSan 可抓）。
+    mutable std::mutex        m_conn_mtx;
+    /// 串行化 ensure_connected → connect_once：断链后多线程同时看到
+    /// !is_open() 时，只让一个线程重连，其余双重检查后直接返回。
+    std::mutex                m_reconnect_mtx;
+    /// 连接代际：每次 connect_once 递增。Handler/Pending 都打上创建时的
+    /// 代际标签，旧连接的迟到回调只影响同代条目（M4 修复）。
+    std::atomic<std::uint64_t> m_generation{0};
     std::vector<std::uint8_t> m_rx;
     bool                      m_alive = false;        ///< 当前连接可用
     bool                      m_closed = false;       ///< 用户显式 close()：禁止重连

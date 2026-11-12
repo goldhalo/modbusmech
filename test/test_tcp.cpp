@@ -1191,3 +1191,228 @@ NETMECH_TEST(async_master_timeout_callback_fires)
     am->close();
     server.mech->close_all();
 }
+
+// ---------------------------------------------------------------------------
+// 25. AsyncMaster：close 之后提交请求，回调仍必须触发（评审 M1）
+//
+//     回归：submit_request 把 done 双重移动（task 捕获一次、reject 再
+//     移动一次），close 后走 reject 时 done 已被移空 → bad_function_call
+//     被派发线程吞掉 → 回调静默丢失，违反"恰好一次"承诺。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(async_master_submit_after_close_still_calls_back)
+{
+    std::uint16_t port = 0;
+    auto bank = std::make_shared<Bank>(10);
+    Slave::Config sc;
+    std::error_code ec;
+    auto slave = make_test_slave(sc, bank, ec, port);
+    REQUIRE(slave != nullptr);
+
+    AsyncMaster::Config ac;
+    ac.timeout     = 500ms;
+    ac.max_workers = 2;
+    auto am = AsyncMaster::create_tcp("127.0.0.1", port, ac, ec);
+    REQUIRE(am != nullptr);
+
+    am->close();
+    CHECK(!am->is_running());
+
+    // close 后提交：必须恰好一次回调（not_connected），不能静默丢失
+    AsyncProbe p;
+    am->read_holding_registers(0, 0, 2, p.fn());
+    REQUIRE(p.wait(3000ms));
+    CHECK(p.r.ec == ModbusErrc::not_connected);
+
+    // 再提交一笔，同样要回调（验证不是偶然）
+    AsyncProbe p2;
+    am->write_single_register(0, 0, 0x1234, [&](Result r) {
+        // WriteFn 探针：复用 AsyncProbe 的等待机制
+        std::lock_guard<std::mutex> lk(p2.mtx);
+        p2.done = true;
+        p2.r = r;
+        p2.cv.notify_all();
+    });
+    REQUIRE(p2.wait(3000ms));
+    CHECK(p2.r.ec == ModbusErrc::not_connected);
+
+    slave->stop();
+}
+
+// ---------------------------------------------------------------------------
+// 26. AsyncMaster：在回调里调 close() 不得 terminate（评审 M2）
+//
+//     回归：close() 的 self-id 检查跳过自 join 后留下 joinable 线程，
+//     ~Impl 销毁 joinable 的 std::thread → std::terminate 整进程。
+//     修复后自线程 detach + 强自持，析构安全。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(async_master_close_from_callback_is_safe)
+{
+    std::uint16_t port = 0;
+    auto bank = std::make_shared<Bank>(10);
+    Slave::Config sc;
+    std::error_code ec;
+    auto slave = make_test_slave(sc, bank, ec, port);
+    REQUIRE(slave != nullptr);
+
+    AsyncMaster::Config ac;
+    ac.timeout     = 1000ms;
+    ac.max_workers = 2;
+    auto am = AsyncMaster::create_tcp("127.0.0.1", port, ac, ec);
+    REQUIRE(am != nullptr);
+
+    AsyncProbe p;
+    auto inner = p.fn();
+    am->read_holding_registers(0, 0, 2,
+        [inner, raw = am.get()](Result r, std::vector<std::uint16_t> v) {
+            raw->close();   // 在派发线程（回调）里关闭：修复前这里埋下 terminate
+            inner(r, std::move(v));
+        });
+    REQUIRE(p.wait(3000ms));
+    CHECK(p.r.ok());
+
+    // close 后再提交：回调仍触发（not_connected）
+    AsyncProbe p2;
+    am->read_holding_registers(0, 0, 2, p2.fn());
+    REQUIRE(p2.wait(3000ms));
+    CHECK(p2.r.ec == ModbusErrc::not_connected);
+
+    am.reset();   // 修复前：~Impl 销毁 joinable 线程 → terminate
+    slave->stop();
+}
+
+// ---------------------------------------------------------------------------
+// 27. TCP 重连并发压测：auto_reconnect + 多线程（评审 M3/M4）
+//
+//     回归：m_conn 无同步读写 + ensure_connected 无串行化，断链后多
+//     线程并发重连是 UB（TSan 可抓）且会向对端发起多条连接；旧连接
+//     迟到回调无代际守卫，会误杀新连接上的在途事务。
+//     短连接服务端（回完就断）+ 串行配额，最大化重连竞态窗口。
+// ---------------------------------------------------------------------------
+NETMECH_TEST(tcp_reconnect_serialized_under_concurrency)
+{
+    auto server = start_oneshot_server();
+    REQUIRE(server.mech != nullptr);
+    REQUIRE(server.port != 0u);
+    const std::uint16_t port = server.port;
+
+    Master::Config mc;
+    mc.timeout        = 2000ms;
+    mc.retries        = 40;      // busy/断链重试：并发争抢配额可能需多次
+    mc.retry_delay    = 2ms;
+    mc.auto_reconnect = true;
+    mc.max_in_flight  = 1;       // 串行配额：突出重连竞态
+
+    std::error_code ec;
+    auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+    REQUIRE(master != nullptr);
+
+    std::atomic<int> ok{0};
+    auto worker = [&] {
+        for (int i = 0; i < 10; ++i) {
+            std::vector<std::uint16_t> regs;
+            const auto r = master->read_holding_registers(0, 2, regs);
+            if (r.ok() && regs.size() == 2u && regs[0] == 0x1234 && regs[1] == 0x5678) {
+                ok.fetch_add(1);
+            }
+        }
+    };
+    std::thread t1(worker), t2(worker), t3(worker), t4(worker);
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    CHECK_EQ(ok.load(), 40);                      // 全部成功，无丢笔/误杀
+    CHECK(master->stats().reconnects >= 20u);     // 短连接：几乎每笔都重连
+
+    master->close();
+    server.mech->close_all();
+}
+
+// ---------------------------------------------------------------------------
+// 28. 主站统计归因：断链/静默丢弃不再混进 timeouts（评审 m6）
+// ---------------------------------------------------------------------------
+namespace {
+
+/// 连上就关的服务端：制造"请求在途时断链"的接收侧错误。
+class DropSession final : public netmech::ConnHandler {
+public:
+    bool on_open(std::shared_ptr<netmech::Conn> c) override
+    {
+        c->close();
+        return true;
+    }
+    void on_read(std::error_code, netmech::Buf, std::size_t) override {}
+    void on_write(std::error_code, netmech::ConstBuf, std::size_t) override {}
+    void on_close() override {}
+};
+
+class DropLink final : public netmech::Linkable {
+public:
+    std::shared_ptr<netmech::ConnHandler> on_accept(netmech::Conn&) override
+    {
+        return std::make_shared<DropSession>();
+    }
+};
+
+} // namespace
+
+NETMECH_TEST(tcp_stats_errors_attributed_correctly)
+{
+    // 场景 A：静默丢弃（不应答）⇒ 真超时，timeouts=1、recv_errors=0
+    {
+        std::uint16_t port = 0;
+        auto bank = std::make_shared<Bank>(10);
+        Slave::Config sc;
+        sc.addresses = {1};            // 只应答 unit 1
+        std::error_code ec;
+        auto slave = make_test_slave(sc, bank, ec, port);
+        REQUIRE(slave != nullptr);
+
+        Master::Config mc;
+        mc.unit    = 2;                // 不在名单 ⇒ 静默丢弃
+        mc.timeout = 200ms;
+        mc.retries = 0;
+        auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+        REQUIRE(master != nullptr);
+
+        std::vector<std::uint16_t> regs;
+        const auto r = master->read_holding_registers(0, 2, regs);
+        CHECK(r.ec == ModbusErrc::timeout);
+        const auto s = master->stats();
+        CHECK_EQ(s.timeouts, std::uint64_t{1});
+        CHECK_EQ(s.recv_errors, std::uint64_t{0});
+
+        master->close();
+        slave->stop();
+    }
+
+    // 场景 B：连上就关 ⇒ 非超时错误（send_errors 或 recv_errors），timeouts=0
+    {
+        auto mech = netmech::Mechanism::create();
+        REQUIRE(mech != nullptr);
+        auto link = std::make_shared<DropLink>();
+        REQUIRE(!mech->listen(netmech::Address::any(0), link));
+        const auto addrs = mech->listening_addresses();
+        REQUIRE(!addrs.empty());
+        const std::uint16_t port = addrs.front().port();
+
+        Master::Config mc;
+        mc.timeout = 1000ms;
+        mc.retries = 0;
+        mc.auto_reconnect = false;
+        std::error_code ec;
+        auto master = Master::create_tcp("127.0.0.1", port, mc, ec);
+        REQUIRE(master != nullptr);
+
+        std::vector<std::uint16_t> regs;
+        const auto r = master->read_holding_registers(0, 2, regs);
+        CHECK(!r.ok());
+        const auto s = master->stats();
+        CHECK_EQ(s.timeouts, std::uint64_t{0});   // 修复前：断链被计成超时
+        CHECK_EQ(s.send_errors + s.recv_errors, std::uint64_t{1});
+
+        master->close();
+        mech->close_all();
+    }
+}

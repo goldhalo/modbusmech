@@ -229,6 +229,11 @@ std::error_code decode_pdu(span<const std::uint8_t> pdu, DecodedPdu& out) noexce
         if (pdu.size() < 5) {
             return make_error_code(ModbusErrc::frame_too_short);
         }
+        // 规范定长 5 字节：尾部多余字节是畸形帧，不能接受
+        // （旧实现只查下限，05/06 从站会把尾部垃圾原样回显给对端）。
+        if (pdu.size() != 5) {
+            return make_error_code(ModbusErrc::bad_length);
+        }
         out.address = get_u16(pdu, 1);
         out.count   = get_u16(pdu, 3);
         break;
@@ -238,6 +243,9 @@ std::error_code decode_pdu(span<const std::uint8_t> pdu, DecodedPdu& out) noexce
         if (pdu.size() < 5) {
             return make_error_code(ModbusErrc::frame_too_short);
         }
+        if (pdu.size() != 5) {
+            return make_error_code(ModbusErrc::bad_length);
+        }
         out.address = get_u16(pdu, 1);
         out.count   = get_u16(pdu, 3);
         break;
@@ -246,6 +254,9 @@ std::error_code decode_pdu(span<const std::uint8_t> pdu, DecodedPdu& out) noexce
     case Function::write_single_register:
         if (pdu.size() < 5) {
             return make_error_code(ModbusErrc::frame_too_short);
+        }
+        if (pdu.size() != 5) {
+            return make_error_code(ModbusErrc::bad_length);
         }
         out.address = get_u16(pdu, 1);
         out.value   = get_u16(pdu, 3);
@@ -365,9 +376,14 @@ std::error_code parse_read_response(span<const std::uint8_t> pdu, Function f,
     return {};
 }
 
-std::error_code parse_write_response(span<const std::uint8_t> pdu, Function f,
-                                     std::uint16_t addr, std::uint16_t cnt,
-                                     Exception& ex) noexcept
+namespace {
+
+/// 写响应解析的唯一实现。check_value=false 时跳过 05/06 值回显校验
+/// （legacy 5 参重载拿不到请求值，保持旧行为）。
+std::error_code parse_write_response_impl(span<const std::uint8_t> pdu, Function f,
+                                          std::uint16_t addr, std::uint16_t cnt,
+                                          std::uint16_t value, bool check_value,
+                                          Exception& ex) noexcept
 {
     ex = Exception::none;
 
@@ -406,8 +422,32 @@ std::error_code parse_write_response(span<const std::uint8_t> pdu, Function f,
         if (get_u16(pdu, 3) != cnt) {
             return make_error_code(ModbusErrc::unexpected_response);
         }
+    } else if (check_value
+               && (f == Function::write_single_coil
+                   || f == Function::write_single_register)) {
+        // 值回显：规范要求响应原样回显请求值，不对即写未生效。
+        if (get_u16(pdu, 3) != value) {
+            return make_error_code(ModbusErrc::unexpected_response);
+        }
     }
     return {};
+}
+
+} // namespace
+
+std::error_code parse_write_response(span<const std::uint8_t> pdu, Function f,
+                                     std::uint16_t addr, std::uint16_t cnt,
+                                     Exception& ex) noexcept
+{
+    // legacy 重载：拿不到请求值，05/06 值回显不校验（保持旧行为）。
+    return parse_write_response_impl(pdu, f, addr, cnt, 0, /*check_value=*/false, ex);
+}
+
+std::error_code parse_write_response(span<const std::uint8_t> pdu, Function f,
+                                     std::uint16_t addr, std::uint16_t cnt,
+                                     std::uint16_t value, Exception& ex) noexcept
+{
+    return parse_write_response_impl(pdu, f, addr, cnt, value, /*check_value=*/true, ex);
 }
 
 } // namespace modbusmech

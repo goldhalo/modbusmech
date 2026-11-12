@@ -127,6 +127,11 @@ public:
 
     /// 关闭：不再接收新请求；在途/排队的请求会以 `not_connected` 结束
     /// （回调仍会触发，保证"恰好一次"），然后等待线程退出。
+    ///
+    /// @note 可以在回调里调用：自线程（派发/工作线程）会被自动 detach，
+    ///       不会自 join；内部线程持有 Impl 强引用，全部退出前对象不析构。
+    /// @note close 之后提交的请求仍会触发一次回调（not_connected），
+    ///       不会静默丢失。
     void close() noexcept;
 
 private:
